@@ -35,6 +35,7 @@ from playwright.async_api import (
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY",  "ua3qtgs5wgk9ygfbsh8ed839zmexm2")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "arx7awfi39mtc9d543afrewaaiiexu")
 
+
 LATITUDE   = float(os.environ.get("LATITUDE",  "12.924674"))
 LONGITUDE  = float(os.environ.get("LONGITUDE", "77.694803"))
 PINCODE    = os.environ.get("PINCODE", "560066")
@@ -83,6 +84,10 @@ class Product:
 # 🔔  PUSHOVER ALERTS
 # =====================================================================
 def send_alert(platform: str, name: str, price, link: str, *, force: bool = False) -> None:
+    if not DRY_RUN and (not PUSHOVER_USER_KEY or not PUSHOVER_APP_TOKEN):
+        log.warning("Pushover credentials missing; alert skipped")
+        return
+
     key = f"{platform.lower()}_{name.lower()}"
     if key in ALERTED and not force:
         return
@@ -215,27 +220,39 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
 
         page = await ctx.new_page()
 
-        # ── Set up XHR interception ──────────────────────────────
+        # ── Set up dual XHR interception ──────────────────────────
         captured: list[dict] = []
         got_response = asyncio.Event()
 
-        async def intercept(resp: Response):
+        # Method 1: page.on("response") — works when browser makes the call
+        async def intercept_resp(resp: Response):
             try:
                 url = resp.url
-                if ("/layout/search" in url or "/search/products" in url or "/search?q=" in url) and resp.status == 200:
-                    ct = resp.headers.get("content-type", "")
-                    if "json" in ct or "text" in ct:
-                        body = await resp.text()
-                        captured.append(json.loads(body))
-                        got_response.set()
+                if "/v1/layout/search" not in url.lower():
+                    return
+                if resp.status != 200:
+                    return
+                ct = resp.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+
+                body = await resp.text()
+                data = json.loads(body)
+                if not isinstance(data, dict):
+                    return
+
+                captured.append(data)
+                if not got_response.is_set():
+                    got_response.set()
+                log.info(f"  {platform}: captured search API ({len(body)} bytes) {url}")
             except Exception:
                 pass
 
-        page.on("response", intercept)
+        page.on("response", intercept_resp)
 
-        # ── Step 1: Go to homepage to pass Cloudflare ─────────────
+        # ── Step 1: Go to homepage to set location ────────────────
         log.debug(f"  {platform}: loading homepage...")
-        await page.goto("https://blinkit.com", wait_until="networkidle", timeout=45_000)
+        await page.goto("https://blinkit.com", wait_until="domcontentloaded", timeout=30_000)
         await page.wait_for_timeout(3000)
 
         # ── Step 2: Set location via pincode ──────────────────────
@@ -253,14 +270,12 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
                 await page.wait_for_timeout(500)
                 await loc_input.fill(AREA_NAME)
                 await page.wait_for_timeout(2500)
-                # Use keyboard to select first suggestion (avoids hidden element issues)
                 await page.keyboard.press("ArrowDown")
                 await page.wait_for_timeout(300)
                 await page.keyboard.press("Enter")
                 log.info(f"  {platform}: selected location via keyboard")
                 await page.wait_for_timeout(3000)
             else:
-                # Fallback: try Detect my location button
                 for sel in [
                     'button:has-text("Detect my location")',
                     'button:has-text("Detect")',
@@ -282,11 +297,11 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
         log.info(f"  {platform}: navigating to search results page")
         await page.goto(f"https://blinkit.com/s/?q={q}",
                         wait_until="domcontentloaded", timeout=30_000)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(5000)
 
         # ── Wait for XHR ─────────────────────────────────────────
         try:
-            await asyncio.wait_for(got_response.wait(), timeout=20)
+            await asyncio.wait_for(got_response.wait(), timeout=15)
         except asyncio.TimeoutError:
             log.warning(f"  {platform}: no XHR captured in 20s")
 
@@ -341,12 +356,14 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
         if not products:
             products = await _dom_fallback(page, platform, SEARCH_QUERY)
 
-        page.remove_listener("response", intercept)
-
     except Exception as e:
         log.error(f"  {platform} error: {e}")
     finally:
         if page and not page.is_closed():
+            try:
+                page.remove_listener("response", intercept_resp)
+            except Exception:
+                pass
             await page.close()
 
     log.info(f"  {platform}: {len(products)} Hot Wheels found")
@@ -695,9 +712,14 @@ async def _dom_fallback(page: Page, platform: str, query: str) -> list[Product]:
             '[data-testid="product-card"], '
             'a[href*="/pn/"], '
             'a[href*="/prn/"], '
+            'a[href*="/p/"], '
+            'a[href*="/product/"], '
             'a[href*="/item/"], '
             'div[class*="ProductCard"], '
             'div[class*="product-card"], '
+            'div[class*="ProductTile"], '
+            'div[class*="search-result"], '
+            'div[class*="SearchResult"], '
             'div[role="listitem"]'
         )
 
@@ -872,6 +894,9 @@ async def main() -> None:
     )
     if DRY_RUN:
         log.info("🧪 DRY RUN MODE — no Pushover alerts will be sent")
+    elif not PUSHOVER_USER_KEY or not PUSHOVER_APP_TOKEN:
+        log.error("PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN must be set when DRY_RUN is false.")
+        sys.exit(1)
 
     # ── Send startup notification ────────────────────────────────
     send_alert(
