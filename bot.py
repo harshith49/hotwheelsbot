@@ -2,7 +2,7 @@
 """
 🏎️  HOT WHEELS ALERT BOT  — Single-file, cloud-ready edition
 =============================================================
-Monitors Blinkit, Zepto & Swiggy Instamart for Hot Wheels stock
+Monitors Blinkit, Zepto, Swiggy Instamart & BigBasket for Hot Wheels stock
 using Playwright browser automation (not raw HTTP — those get blocked).
 
 Deploy: Railway / Render / any Docker host / local
@@ -47,6 +47,7 @@ HEADLESS         = os.environ.get("HEADLESS", "true").lower() == "true"
 ENABLE_BLINKIT   = os.environ.get("ENABLE_BLINKIT",   "true").lower() == "true"
 ENABLE_ZEPTO     = os.environ.get("ENABLE_ZEPTO",     "true").lower() == "true"
 ENABLE_INSTAMART = os.environ.get("ENABLE_INSTAMART", "true").lower() == "true"
+ENABLE_BIGBASKET = os.environ.get("ENABLE_BIGBASKET", "true").lower() == "true"
 DRY_RUN          = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 # =====================================================================
@@ -218,37 +219,34 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
             {"name": "gr_1_lng", "value": str(LONGITUDE), "domain": ".blinkit.com", "path": "/"},
         ])
 
-        page = await ctx.new_page()
-
-        # ── Set up dual XHR interception ──────────────────────────
+        # ── Set up XHR interception BEFORE navigation ───────────
         captured: list[dict] = []
         got_response = asyncio.Event()
 
-        # Method 1: page.on("response") — works when browser makes the call
-        async def intercept_resp(resp: Response):
+        async def handle_route(route):
             try:
-                url = resp.url
-                if "/v1/layout/search" not in url.lower():
-                    return
-                if resp.status != 200:
-                    return
-                ct = resp.headers.get("content-type", "")
-                if "json" not in ct:
-                    return
-
-                body = await resp.text()
-                data = json.loads(body)
-                if not isinstance(data, dict):
-                    return
-
-                captured.append(data)
-                if not got_response.is_set():
-                    got_response.set()
-                log.info(f"  {platform}: captured search API ({len(body)} bytes) {url}")
+                resp = await route.fetch()
+                if resp.status == 200:
+                    ct = resp.headers.get("content-type", "")
+                    if "json" in ct.lower():
+                        body_bytes = await resp.body()
+                        if body_bytes:
+                            try:
+                                data = json.loads(body_bytes.decode("utf-8"))
+                                if isinstance(data, dict) and ("response" in data or "snippets" in data):
+                                    captured.append(data)
+                                    got_response.set()
+                            except json.JSONDecodeError:
+                                pass
+                await route.fulfill(response=resp, body=body_bytes if body_bytes else b"")
             except Exception:
-                pass
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
 
-        page.on("response", intercept_resp)
+        page = await ctx.new_page()
+        await page.route("**/v1/layout/search**", handle_route)
 
         # ── Step 1: Go to homepage to set location ────────────────
         log.debug(f"  {platform}: loading homepage...")
@@ -303,7 +301,7 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
         try:
             await asyncio.wait_for(got_response.wait(), timeout=15)
         except asyncio.TimeoutError:
-            log.warning(f"  {platform}: no XHR captured in 20s")
+            pass
 
         # ── Parse XHR data ───────────────────────────────────────
         for data in captured:
@@ -361,7 +359,7 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
     finally:
         if page and not page.is_closed():
             try:
-                page.remove_listener("response", intercept_resp)
+                await page.unroute("**/v1/layout/search**")
             except Exception:
                 pass
             await page.close()
@@ -700,6 +698,100 @@ async def scan_instamart(ctx: BrowserContext) -> list[Product]:
 
 
 # =====================================================================
+#   🛒  BIGBASKET SCRAPER
+# =====================================================================
+async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
+    platform = "BigBasket"
+    log.info(f"🔴 Scanning {platform}...")
+
+    products: list[Product] = []
+    page: Optional[Page] = None
+
+    try:
+        page = await ctx.new_page()
+
+        # ── Set up XHR interception ──────────────────────────────
+        captured: list[dict] = []
+        got_response = asyncio.Event()
+
+        async def handle_route(route):
+            try:
+                resp = await route.fetch()
+                if resp.status == 200:
+                    ct = resp.headers.get("content-type", "")
+                    if "json" in ct.lower():
+                        body_bytes = await resp.body()
+                        if body_bytes:
+                            try:
+                                data = json.loads(body_bytes.decode("utf-8"))
+                                if isinstance(data, dict) and ("tab_list" in data or "data" in data):
+                                    captured.append(data)
+                                    got_response.set()
+                            except json.JSONDecodeError:
+                                pass
+                await route.fulfill(response=resp, body=body_bytes if body_bytes else b"")
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        page = await ctx.new_page()
+        await page.route("**/search**", handle_route)
+
+        # ── Navigate to search page ──────────────────────────────
+        q = SEARCH_QUERY.replace(" ", "+")
+        log.info(f"  {platform}: navigating to search")
+        await page.goto(
+            f"https://www.bigbasket.com/search/?q={q}",
+            wait_until="domcontentloaded", timeout=45_000
+        )
+        await page.wait_for_timeout(3000)
+
+        # ── Wait for API response ────────────────────────────────
+        try:
+            await asyncio.wait_for(got_response.wait(), timeout=12)
+        except asyncio.TimeoutError:
+            pass
+
+        # ── Parse API response ───────────────────────────────────
+        for data in captured:
+            items = data.get("tab_list", [])
+            for tab in items:
+                tab_products = tab.get("product_sku_list", [])
+                for item in tab_products:
+                    name = item.get("product_name", "")
+                    nl = name.lower()
+                    if "hot wheels" not in nl and "hotwheels" not in nl:
+                        continue
+                    
+                    pid = str(item.get("sku_id", item.get("product_id", name)))
+                    in_stock = item.get("is_visible", False)
+                    price = item.get("offer_price", item.get("mrp", "N/A"))
+                    link = f"https://www.bigbasket.com/pd/{pid}/"
+                    img = item.get("image_url", "")
+                    
+                    products.append(Product(platform, name, price, in_stock, pid, link, img))
+
+        # ── DOM fallback ─────────────────────────────────────────
+        if not products:
+            products = await _dom_fallback(page, platform, SEARCH_QUERY)
+
+    except Exception as e:
+        log.error(f"  {platform} error: {e}")
+    finally:
+        if page and not page.is_closed():
+            try:
+                await page.unroute("**/search**")
+            except Exception:
+                pass
+            await page.close()
+
+    log.info(f"  {platform}: {len(products)} Hot Wheels found")
+    return products
+
+
+# =====================================================================
 #   🧩  SHARED DOM FALLBACK  — works for all platforms
 # =====================================================================
 async def _dom_fallback(page: Page, platform: str, query: str) -> list[Product]:
@@ -852,6 +944,8 @@ async def run_scan(ctx: BrowserContext) -> None:
         scanners.append(("Zepto", scan_zepto))
     if ENABLE_INSTAMART:
         scanners.append(("Instamart", scan_instamart))
+    if ENABLE_BIGBASKET:
+        scanners.append(("BigBasket", scan_bigbasket))
 
     # Run all scrapers concurrently
     tasks = [asyncio.create_task(fn(ctx)) for _, fn in scanners]
@@ -890,7 +984,8 @@ async def main() -> None:
         f"🛒 Platforms: "
         f"{'Blinkit ' if ENABLE_BLINKIT else ''}"
         f"{'Zepto ' if ENABLE_ZEPTO else ''}"
-        f"{'Instamart' if ENABLE_INSTAMART else ''}"
+        f"{'Instamart ' if ENABLE_INSTAMART else ''}"
+        f"{'BigBasket' if ENABLE_BIGBASKET else ''}"
     )
     if DRY_RUN:
         log.info("🧪 DRY RUN MODE — no Pushover alerts will be sent")
