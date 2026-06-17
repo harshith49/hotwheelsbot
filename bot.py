@@ -123,6 +123,81 @@ def mark_oos(platform: str, name: str) -> None:
         OUT_OF_STOCK.add(key)
         ALERTED.discard(key)
 
+
+class BlinkitBlockedException(Exception):
+    pass
+
+async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
+    """Fetch free Indian proxies from Geonode and find one that bypasses Cloudflare on Blinkit."""
+    url = 'https://proxylist.geonode.com/api/proxy-list?country=IN&limit=50&page=1&sort_by=lastChecked&sort_type=desc'
+    log.info("Fetching fresh proxy list from Geonode...")
+    try:
+        r = http_requests.get(url, timeout=10)
+        res = r.json()
+        proxies = res.get('data', [])
+    except Exception as e:
+        log.error(f"Failed to fetch proxy list: {e}")
+        return None
+
+    if not proxies:
+        log.warning("No proxies returned from Geonode.")
+        return None
+
+    log.info(f"Fetched {len(proxies)} Indian proxies. Testing concurrently...")
+
+    async def check_proxy(p) -> Optional[str]:
+        proto = p['protocols'][0]
+        ip = p['ip']
+        port = p['port']
+        proxy_server = f"{proto}://{ip}:{port}"
+        
+        if proto not in ['socks4', 'socks5', 'http', 'https']:
+            return None
+
+        browser = None
+        try:
+            browser = await pw.chromium.launch(
+                headless=True,
+                proxy={"server": proxy_server},
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ]
+            )
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            response = await page.goto("https://blinkit.com", wait_until="domcontentloaded", timeout=12000)
+            
+            title = await page.title()
+            body_text = await page.inner_text("body")
+            
+            if response and response.status == 200 and "blocked" not in body_text.lower() and "access denied" not in body_text.lower() and "error page" not in title.lower():
+                log.info(f"✅ FOUND WORKING Indian proxy: {proxy_server}")
+                return proxy_server
+        except Exception:
+            pass
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except:
+                    pass
+        return None
+
+    # Run checks concurrently to find a working proxy fast
+    tasks = [asyncio.create_task(check_proxy(p)) for p in proxies]
+    results = await asyncio.gather(*tasks)
+    
+    working = [r for r in results if r is not None]
+    if working:
+        return working[0]
+    return None
+
 # =====================================================================
 # 🌐  BROWSER MANAGER
 # =====================================================================
@@ -136,18 +211,37 @@ class BrowserManager:
 
     async def start(self) -> BrowserContext:
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-web-security",
-                "--disable-features=VizDisplayCompositor",
-                "--window-size=1920,1080",
-            ],
-        )
+        
+        # Dynamically fetch a working proxy
+        proxy_server = None
+        try:
+            proxy_server = await fetch_working_proxy(self._pw)
+        except Exception as e:
+            log.error(f"Error checking proxies: {e}")
+            
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-web-security",
+            "--disable-features=VizDisplayCompositor",
+            "--window-size=1920,1080",
+        ]
+        
+        if proxy_server:
+            log.info(f"🚀 Launching browser with proxy: {proxy_server}")
+            self._browser = await self._pw.chromium.launch(
+                headless=HEADLESS,
+                proxy={"server": proxy_server},
+                args=launch_args,
+            )
+        else:
+            log.warning("⚠️ No working Indian proxy found. Launching directly (might be blocked on Railway)...")
+            self._browser = await self._pw.chromium.launch(
+                headless=HEADLESS,
+                args=launch_args,
+            )
         self._context = await self._browser.new_context(
             geolocation={"latitude": LATITUDE, "longitude": LONGITUDE},
             permissions=["geolocation"],
@@ -345,14 +439,22 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
             if not products:
                 try:
                     body_text = await page.inner_text("body")
-                    log.warning(f"  {platform} DOM fallback failed. Body snippet: {body_text[:600].replace(chr(10), ' ')}")
+                    snippet = body_text[:600].replace('\n', ' ').replace('\r', ' ')
+                    log.warning(f"  {platform} DOM fallback failed. Body snippet: {snippet}")
+                    if "blocked" in snippet.lower() or "access denied" in snippet.lower() or "error page" in title.lower():
+                        raise BlinkitBlockedException("Blinkit blocked by Cloudflare (Access Denied)")
+                except BlinkitBlockedException:
+                    raise
                 except Exception as e:
                     log.warning(f"  {platform} failed to extract body text: {e}")
 
         page.remove_listener("response", intercept)
 
+    except BlinkitBlockedException:
+        raise
     except Exception as e:
         log.error(f"  {platform} error: {e}")
+        raise BlinkitBlockedException(f"Blinkit context failed: {e}")
     finally:
         if page and not page.is_closed():
             await page.close()
@@ -429,6 +531,8 @@ async def run_scan(ctx: BrowserContext) -> None:
 
     try:
         results = await scan_blinkit(ctx)
+    except BlinkitBlockedException:
+        raise
     except Exception as e:
         log.error(f"  Blinkit crashed: {e}")
         return
@@ -495,6 +599,14 @@ async def main() -> None:
         while not shutdown.is_set():
             try:
                 await run_scan(ctx)
+            except BlinkitBlockedException as e:
+                log.warning(f"💥 Scan blocked: {e}. Re-initializing browser with a new proxy...")
+                try:
+                    await mgr.stop()
+                    await asyncio.sleep(2)
+                    ctx = await mgr.start()
+                except Exception as ex:
+                    log.error(f"Failed to restart browser context: {ex}")
             except Exception as e:
                 log.error(f"💥 Scan loop error: {e}")
 
