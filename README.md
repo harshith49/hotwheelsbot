@@ -1,13 +1,13 @@
 # 🏎️ Hot Wheels Alert Bot
 
-Real-time stock monitoring for Hot Wheels on **Blinkit**, **Zepto**, and **Swiggy Instamart** with instant Pushover notifications.
+Real-time stock monitoring for Hot Wheels on **Blinkit** with instant Pushover notifications.
 
 ## How It Works
 
 Uses **Playwright browser automation** (not raw HTTP requests) to bypass anti-bot protections. The bot:
 
 1. Launches a headless Chromium browser
-2. Navigates to each platform's search page
+2. Navigates to Blinkit's search page
 3. Intercepts the real API responses the browser receives
 4. Parses product data (name, price, stock status)
 5. Sends Pushover alerts for in-stock items
@@ -45,13 +45,10 @@ HEADLESS=false python bot.py
 | `LATITUDE` | ✅ | `12.924674` | Your latitude |
 | `LONGITUDE` | ✅ | `77.694803` | Your longitude |
 | `PINCODE` | — | `560066` | Nearest pincode |
-| `AREA_NAME` | — | `Bellandur, Bangalore` | Area name for Swiggy |
+| `AREA_NAME` | — | `Bellandur, Bangalore` | Area name for Blinkit |
 | `SCAN_INTERVAL` | — | `60` | Seconds between scans |
 | `SEARCH_QUERY` | — | `hot wheels` | What to search for |
 | `HEADLESS` | — | `true` | `true` for cloud, `false` for local debugging |
-| `ENABLE_BLINKIT` | — | `true` | Enable/disable Blinkit |
-| `ENABLE_ZEPTO` | — | `true` | Enable/disable Zepto |
-| `ENABLE_INSTAMART` | — | `true` | Enable/disable Instamart |
 | `DRY_RUN` | — | `false` | Log alerts without sending |
 
 4. Deploy! Railway will build the Docker image and start scanning.
@@ -59,7 +56,7 @@ HEADLESS=false python bot.py
 ## Files
 
 ```
-bot.py              ← Everything: scrapers + alerts + loop (single file)
+bot.py              ← Everything: scraper + alerts + loop (single file)
 requirements.txt    ← Python dependencies
 Dockerfile          ← Docker build (Railway uses this)
 railway.toml        ← Railway deploy config
@@ -72,13 +69,12 @@ railway.toml        ← Railway deploy config
 ┌─────────────────────────────────────────────┐
 │              SCAN LOOP (every 60s)          │
 │                                             │
-│   ┌──────────┐ ┌──────────┐ ┌───────────┐  │
-│   │ Blinkit  │ │  Zepto   │ │ Instamart │  │  ← Playwright headless
-│   │ scraper  │ │  scraper │ │  scraper  │  │     Chromium browser
-│   └────┬─────┘ └────┬─────┘ └─────┬─────┘  │
-│        │             │             │         │
-│        └─────────────┼─────────────┘         │
-│                      ▼                       │
+│                 ┌──────────┐                │
+│                 │ Blinkit  │                │  ← Playwright headless
+│                 │ scraper  │                │     Chromium browser
+│                 └────┬─────┘                │
+│                      │                      │
+│                      ▼                      │
 │              In-stock products?              │
 │              ┌──────┴──────┐                 │
 │              ▼             ▼                 │
@@ -90,8 +86,7 @@ railway.toml        ← Railway deploy config
 
 ## Notes
 
-- **No raw API calls** — all three platforms block direct HTTP requests (403 / Cloudflare / request signing)
+- **No raw API calls** — Blinkit blocks direct HTTP requests (403 / Cloudflare)
 - **XHR interception** — captures the actual JSON API responses the browser receives
 - **DOM fallback** — if XHR capture fails, scrapes product cards from the page
 - **Duplicate protection** — won't spam you; alerts once per product, re-alerts on restock
-- **Concurrent** — all 3 platforms scanned simultaneously per cycle
