@@ -313,7 +313,12 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
                     continue
                 pid_data = obj.get("identity", {})
                 pid = str(pid_data.get("id", obj.get("id", obj.get("product_id", name))))
-                in_stock = True  # if it appears in search results, it's available
+                
+                # Check actual stock state from JSON to support "Coming Soon" and Out of Stock
+                is_sold_out = obj.get("is_sold_out", False)
+                product_state = str(obj.get("product_state", "available")).lower()
+                inventory = obj.get("inventory", 1)
+                in_stock = (not is_sold_out) and (product_state == "available") and (inventory > 0)
                 raw_price = obj.get("normal_price", obj.get("offer_price", obj.get("price", obj.get("mrp", "N/A"))))
                 if isinstance(raw_price, dict):
                     raw_price = raw_price.get("text", "N/A")
@@ -381,7 +386,7 @@ async def _dom_fallback(page: Page, platform: str, query: str) -> list[Product]:
                         price = line.replace("₹", "").strip().split()[0]
                         break
 
-                in_stock = "out of stock" not in tl and "sold out" not in tl and "notify" not in tl
+                in_stock = "out of stock" not in tl and "sold out" not in tl and "notify" not in tl and "coming soon" not in tl
 
                 href = await card.get_attribute("href") or ""
                 link = href if href.startswith("http") else f"https://blinkit.com{href}" if href else ""
