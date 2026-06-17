@@ -336,7 +336,18 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
 
         # ── DOM fallback ─────────────────────────────────────────
         if not products:
+            try:
+                title = await page.title()
+                log.warning(f"  {platform} XHR failed, trying DOM fallback. Page title: {title}")
+            except Exception:
+                title = "Unknown"
             products = await _dom_fallback(page, platform, SEARCH_QUERY)
+            if not products:
+                try:
+                    body_text = await page.inner_text("body")
+                    log.warning(f"  {platform} DOM fallback failed. Body snippet: {body_text[:600].replace(chr(10), ' ')}")
+                except Exception as e:
+                    log.warning(f"  {platform} failed to extract body text: {e}")
 
         page.remove_listener("response", intercept)
 
