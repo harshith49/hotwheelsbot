@@ -128,32 +128,45 @@ class BlinkitBlockedException(Exception):
     pass
 
 async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
-    """Fetch free Indian proxies from Geonode and find one that bypasses Cloudflare on Blinkit."""
-    url = 'https://proxylist.geonode.com/api/proxy-list?country=IN&limit=50&page=1&sort_by=lastChecked&sort_type=desc'
+    """Fetch free Indian proxies from Geonode and Proxyscrape and find one that bypasses Cloudflare on Blinkit."""
+    all_proxies = []
+
+    # 1. Fetch from Geonode
+    geonode_url = 'https://proxylist.geonode.com/api/proxy-list?country=IN&limit=50&page=1&sort_by=lastChecked&sort_type=desc'
     log.info("Fetching fresh proxy list from Geonode...")
     try:
-        r = http_requests.get(url, timeout=10)
+        r = http_requests.get(geonode_url, timeout=10)
         res = r.json()
-        proxies = res.get('data', [])
+        for p in res.get('data', []):
+            proto = p['protocols'][0]
+            if proto in ['socks4', 'socks5', 'http', 'https']:
+                all_proxies.append(f"{proto}://{p['ip']}:{p['port']}")
     except Exception as e:
-        log.error(f"Failed to fetch proxy list: {e}")
+        log.warning(f"Failed to fetch from Geonode: {e}")
+
+    # 2. Fetch from Proxyscrape
+    protocols = ['socks4', 'socks5', 'http']
+    log.info("Fetching fresh proxy lists from Proxyscrape...")
+    for proto in protocols:
+        url = f'https://api.proxyscrape.com/v2/?request=displayproxies&protocol={proto}&timeout=10000&country=IN&ssl=all&anonymity=all'
+        try:
+            r = http_requests.get(url, timeout=10)
+            for line in r.text.strip().split('\n'):
+                line = line.strip()
+                if line and ':' in line:
+                    all_proxies.append(f"{proto}://{line}")
+        except Exception as e:
+            log.warning(f"Failed to fetch {proto} from Proxyscrape: {e}")
+
+    # Deduplicate proxies
+    unique_proxies = list(set(all_proxies))
+    if not unique_proxies:
+        log.warning("No proxies found from either Geonode or Proxyscrape.")
         return None
 
-    if not proxies:
-        log.warning("No proxies returned from Geonode.")
-        return None
+    log.info(f"Deduplicated to {len(unique_proxies)} unique Indian proxies to test.")
 
-    log.info(f"Fetched {len(proxies)} Indian proxies. Testing concurrently...")
-
-    async def check_proxy(p) -> Optional[str]:
-        proto = p['protocols'][0]
-        ip = p['ip']
-        port = p['port']
-        proxy_server = f"{proto}://{ip}:{port}"
-        
-        if proto not in ['socks4', 'socks5', 'http', 'https']:
-            return None
-
+    async def check_proxy(proxy_server: str) -> Optional[str]:
         browser = None
         try:
             browser = await pw.chromium.launch(
@@ -184,18 +197,32 @@ async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
         finally:
             if browser:
                 try:
-                    await browser.close()
-                except:
+                    # Enforce a 5s timeout on browser close to avoid hanging processes
+                    await asyncio.wait_for(browser.close(), timeout=5.0)
+                except Exception:
                     pass
         return None
 
-    # Run checks concurrently to find a working proxy fast
-    tasks = [asyncio.create_task(check_proxy(p)) for p in proxies]
-    results = await asyncio.gather(*tasks)
-    
-    working = [r for r in results if r is not None]
-    if working:
-        return working[0]
+    # Test in chunks of 3 to avoid overloading CPU/RAM (especially on Railway container memory limits)
+    chunk_size = 3
+    for i in range(0, len(unique_proxies), chunk_size):
+        chunk = unique_proxies[i:i+chunk_size]
+        log.info(f"Testing proxy chunk {i//chunk_size + 1} ({len(chunk)} proxies)...")
+        
+        async def safe_check_proxy(p):
+            try:
+                # Enforce a 20s timeout on testing each proxy
+                return await asyncio.wait_for(check_proxy(p), timeout=20.0)
+            except Exception:
+                return None
+                
+        tasks = [asyncio.create_task(safe_check_proxy(p)) for p in chunk]
+        results = await asyncio.gather(*tasks)
+        working = [r for r in results if r is not None]
+        if working:
+            return working[0]
+            
+    log.warning("No working proxy found in any chunk.")
     return None
 
 # =====================================================================
@@ -467,11 +494,21 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
 # =====================================================================
 async def _dom_fallback(page: Page, platform: str, query: str) -> list[Product]:
     """Last resort: scrape visible product cards from the DOM."""
+    import re
     products: list[Product] = []
+    
+    def slugify(t: str) -> str:
+        t = t.lower()
+        t = re.sub(r'[^a-z0-9]+', '-', t)
+        return t.strip('-')
+
     try:
         await page.wait_for_timeout(5000)
 
+        # Updated selectors to include Blinkit's div[role="button"][id] product card elements
         cards = await page.query_selector_all(
+            'div[role="button"][id]:not([id="product_container"]), '
+            'div[class*="tw-items-start"][class*="tw-flex-col"], '
             '[data-testid="product-card"], '
             'a[href*="/prn/"], '
             'a[href*="/item/"], '
@@ -480,6 +517,8 @@ async def _dom_fallback(page: Page, platform: str, query: str) -> list[Product]:
             'div[role="listitem"]'
         )
 
+        seen_ids = set()
+
         for card in cards:
             try:
                 text = await card.inner_text()
@@ -487,11 +526,32 @@ async def _dom_fallback(page: Page, platform: str, query: str) -> list[Product]:
                 if "hot wheels" not in tl and "hotwheels" not in tl:
                     continue
 
+                card_id = await card.get_attribute("id") or ""
+                card_id = card_id.strip()
+
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
-                # Filter out button text, short labels, etc.
-                SKIP_WORDS = {"add", "added", "notify", "notify me", "remove", "+", "-", "out of stock", "sold out"}
-                name_lines = [l for l in lines if l.lower() not in SKIP_WORDS and len(l) > 3]
-                name = name_lines[0] if name_lines else "Hot Wheels (unknown)"
+                SKIP_WORDS = {
+                    "add", "added", "notify", "notify me", "remove", "+", "-", 
+                    "out of stock", "sold out", "coming soon", "mins", "min", "minutes"
+                }
+
+                # Find name: first line containing hot wheels / hotwheels
+                name = "Hot Wheels (unknown)"
+                for line in lines:
+                    ll = line.lower()
+                    if "hot wheels" in ll or "hotwheels" in ll:
+                        name = line
+                        break
+                else:
+                    # Fallback name logic if no line contains hot wheels explicitly
+                    for line in lines:
+                        ll = line.lower()
+                        if (ll not in SKIP_WORDS and 
+                            len(line) > 3 and 
+                            not re.match(r'^\d+\s*mins?$', ll) and 
+                            "₹" not in line):
+                            name = line
+                            break
 
                 price: str | float = "N/A"
                 for line in lines:
@@ -501,16 +561,27 @@ async def _dom_fallback(page: Page, platform: str, query: str) -> list[Product]:
 
                 in_stock = "out of stock" not in tl and "sold out" not in tl and "notify" not in tl and "coming soon" not in tl
 
-                href = await card.get_attribute("href") or ""
-                link = href if href.startswith("http") else f"https://blinkit.com{href}" if href else ""
+                # Direct URL structure: /prn/[slug]/prid/[product-id]
+                if card_id and card_id.isdigit():
+                    product_id = card_id
+                    slug = slugify(name)
+                    link = f"https://blinkit.com/prn/{slug}/prid/{product_id}"
+                else:
+                    product_id = f"dom_{abs(hash(name))}"
+                    href = await card.get_attribute("href") or ""
+                    link = href if href.startswith("http") else f"https://blinkit.com{href}" if href else f"https://blinkit.com/s/?q={query.replace(' ', '+')}"
+
+                if product_id in seen_ids:
+                    continue
+                seen_ids.add(product_id)
 
                 products.append(Product(
                     platform=platform,
                     name=name,
                     price=price,
                     in_stock=in_stock,
-                    product_id=f"dom_{abs(hash(name))}",
-                    link=link or f"https://blinkit.com/s/?q={query.replace(' ', '+')}",
+                    product_id=product_id,
+                    link=link,
                 ))
             except Exception:
                 continue
@@ -554,8 +625,53 @@ async def run_scan(ctx: BrowserContext) -> None:
         f"Next in {SCAN_INTERVAL}s ═══\n"
     )
 
+# =====================================================================
+# 🏥  HEALTH CHECK HTTP SERVER  — keeps Railway happy
+# =====================================================================
+async def handle_health_check(reader, writer):
+    try:
+        # Drain headers
+        await reader.readuntil(b"\r\n\r\n")
+    except Exception:
+        pass
+    
+    response = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n\r\n"
+        "OK"
+    )
+    try:
+        writer.write(response.encode())
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+async def start_health_check_server():
+    port_str = os.environ.get("PORT")
+    if not port_str:
+        log.info("No PORT env var found, skipping health check HTTP server.")
+        return
+    try:
+        port = int(port_str)
+        server = await asyncio.start_server(handle_health_check, "0.0.0.0", port)
+        log.info(f"Health check HTTP server listening on port {port} ✅")
+        # Keep server running in the background loop
+        asyncio.create_task(server.serve_forever())
+    except Exception as e:
+        log.error(f"Failed to start health check server: {e}")
+
 async def main() -> None:
     log.info("🏁 Hot Wheels Alert Bot — STARTING")
+    # Start health check server
+    await start_health_check_server()
     log.info(f"📍 Location: {LATITUDE}, {LONGITUDE} ({AREA_NAME})")
     log.info(f"🔍 Query: '{SEARCH_QUERY}'")
     log.info(f"⏱️  Interval: {SCAN_INTERVAL}s")
