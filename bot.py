@@ -166,22 +166,30 @@ async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
 
     log.info(f"Deduplicated to {len(unique_proxies)} unique Indian proxies to test.")
 
-    async def check_proxy(proxy_server: str) -> Optional[str]:
-        browser = None
+    # Launch a single validator browser instance to run all tests
+    validator_browser = None
+    try:
+        validator_browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-web-security",
+            ]
+        )
+    except Exception as e:
+        log.error(f"Failed to launch validator browser: {e}")
+        return None
+
+    async def check_proxy_context(proxy_server: str) -> Optional[str]:
+        context = None
         try:
-            browser = await pw.chromium.launch(
-                headless=True,
-                proxy={"server": proxy_server},
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ]
-            )
-            context = await browser.new_context(
+            context = await validator_browser.new_context(
                 viewport={"width": 1280, "height": 720},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                proxy={"server": proxy_server}
             )
             page = await context.new_page()
             response = await page.goto("https://blinkit.com", wait_until="domcontentloaded", timeout=8000)
@@ -195,35 +203,42 @@ async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
         except Exception:
             pass
         finally:
-            if browser:
+            if context:
                 try:
-                    # Enforce a 5s timeout on browser close to avoid hanging processes
-                    await asyncio.wait_for(browser.close(), timeout=5.0)
+                    await context.close()
                 except Exception:
                     pass
         return None
 
-    # Test in chunks of 3 to avoid overloading CPU/RAM (especially on Railway container memory limits)
-    chunk_size = 3
-    for i in range(0, len(unique_proxies), chunk_size):
-        chunk = unique_proxies[i:i+chunk_size]
-        log.info(f"Testing proxy chunk {i//chunk_size + 1} ({len(chunk)} proxies)...")
-        
-        async def safe_check_proxy(p):
-            try:
-                # Enforce a 20s timeout on testing each proxy
-                return await asyncio.wait_for(check_proxy(p), timeout=20.0)
-            except Exception:
-                return None
-                
-        tasks = [asyncio.create_task(safe_check_proxy(p)) for p in chunk]
-        results = await asyncio.gather(*tasks)
-        working = [r for r in results if r is not None]
-        if working:
-            return working[0]
+    async def safe_check_proxy(p: str) -> Optional[str]:
+        try:
+            return await asyncio.wait_for(check_proxy_context(p), timeout=20.0)
+        except Exception:
+            return None
+
+    # Test in chunks of 5 (lightweight contexts make this fast and safe)
+    chunk_size = 5
+    working_proxy = None
+    try:
+        for i in range(0, len(unique_proxies), chunk_size):
+            chunk = unique_proxies[i:i+chunk_size]
+            log.info(f"Testing proxy chunk {i//chunk_size + 1} ({len(chunk)} proxies)...")
             
-    log.warning("No working proxy found in any chunk.")
-    return None
+            tasks = [asyncio.create_task(safe_check_proxy(p)) for p in chunk]
+            results = await asyncio.gather(*tasks)
+            working = [r for r in results if r is not None]
+            if working:
+                working_proxy = working[0]
+                break
+    finally:
+        # Guarantee that the single browser process is closed
+        if validator_browser:
+            try:
+                await asyncio.wait_for(validator_browser.close(), timeout=10.0)
+            except Exception:
+                pass
+
+    return working_proxy
 
 # =====================================================================
 # 🌐  BROWSER MANAGER
@@ -695,7 +710,7 @@ async def main() -> None:
 
     # ── Start browser ────────────────────────────────────────────
     mgr = BrowserManager()
-    ctx = await mgr.start()
+    ctx = None  # Will be initialized inside the scan loop
 
     # ── Graceful shutdown ────────────────────────────────────────
     shutdown = asyncio.Event()
@@ -713,16 +728,24 @@ async def main() -> None:
     # ── Scan loop ────────────────────────────────────────────────
     try:
         while not shutdown.is_set():
+            if not ctx:
+                try:
+                    ctx = await mgr.start()
+                except Exception as e:
+                    log.error(f"Failed to start browser manager: {e}")
+                    await asyncio.sleep(10)
+                    continue
+
             try:
                 await run_scan(ctx)
             except BlinkitBlockedException as e:
                 log.warning(f"💥 Scan blocked: {e}. Re-initializing browser with a new proxy...")
+                ctx = None
                 try:
                     await mgr.stop()
-                    await asyncio.sleep(2)
-                    ctx = await mgr.start()
                 except Exception as ex:
-                    log.error(f"Failed to restart browser context: {ex}")
+                    log.error(f"Error stopping browser manager: {ex}")
+                await asyncio.sleep(2)
                 continue
             except Exception as e:
                 log.error(f"💥 Scan loop error: {e}")
