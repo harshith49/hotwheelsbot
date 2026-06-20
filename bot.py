@@ -34,6 +34,9 @@ from playwright.async_api import (
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY",  "ua3qtgs5wgk9ygfbsh8ed839zmexm2")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "arx7awfi39mtc9d543afrewaaiiexu")
 
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
+
 LATITUDE   = float(os.environ.get("LATITUDE",  "12.924674"))
 LONGITUDE  = float(os.environ.get("LONGITUDE", "77.694803"))
 PINCODE    = os.environ.get("PINCODE", "560066")
@@ -74,46 +77,83 @@ class Product:
     image_url:  str = ""
 
 # =====================================================================
-# 🔔  PUSHOVER ALERTS
+# 🔔  ALERTS (Pushover & Telegram)
 # =====================================================================
+def send_telegram_message(text: str, link: Optional[str] = None) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    formatted_text = text
+    if link:
+        formatted_text = f"{text}\n\n🔗 [Open App / Buy Now]({link})"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": formatted_text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": False
+    }
+    try:
+        r = http_requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            log.warning(f"Telegram API {r.status_code}: {r.text}")
+    except Exception as e:
+        log.error(f"Telegram failed: {e}")
+
 def send_alert(platform: str, name: str, price: float | str, link: str, *, force: bool = False) -> None:
     key = f"{platform.lower()}_{name.lower()}"
     if key in ALERTED and not force:
         return
 
     msg = f"🏎️ {name}\n💰 ₹{price}\n🏪 {platform} — Near your location!"
-    payload = {
-        "token":     PUSHOVER_APP_TOKEN,
-        "user":      PUSHOVER_USER_KEY,
-        "title":     f"🚨 Hot Wheels IN STOCK — {platform}",
-        "message":   msg,
-        "url":       link,
-        "url_title": "Open App / Buy Now",
-        "priority":  1,
-        "sound":     "siren",
-    }
 
     if DRY_RUN:
         log.info(f"[DRY RUN] 🔔 Would alert → {platform}: {name} @ ₹{price}")
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            log.info(f"[DRY RUN] Would send Telegram alert → {msg}")
         if not force:
             ALERTED.add(key)
         return
 
-    try:
-        r = http_requests.post(
-            "https://api.pushover.net/1/messages.json",
-            data=payload,
-            timeout=10,
-        )
-        if r.status_code == 200:
-            log.info(f"🔔 Alert fired → {platform}: {name} @ ₹{price}")
-            if not force:
-                ALERTED.add(key)
-                OUT_OF_STOCK.discard(key)
-        else:
-            log.warning(f"Pushover {r.status_code}: {r.text}")
-    except Exception as e:
-        log.error(f"Pushover failed: {e}")
+    alert_sent = False
+
+    # 1. Pushover Send
+    if PUSHOVER_APP_TOKEN and PUSHOVER_USER_KEY:
+        payload = {
+            "token":     PUSHOVER_APP_TOKEN,
+            "user":      PUSHOVER_USER_KEY,
+            "title":     f"🚨 Hot Wheels IN STOCK — {platform}",
+            "message":   msg,
+            "url":       link,
+            "url_title": "Open App / Buy Now",
+            "priority":  1,
+            "sound":     "siren",
+        }
+        try:
+            r = http_requests.post(
+                "https://api.pushover.net/1/messages.json",
+                data=payload,
+                timeout=10,
+            )
+            if r.status_code == 200:
+                log.info(f"🔔 Pushover alert fired → {platform}: {name} @ ₹{price}")
+                alert_sent = True
+            else:
+                log.warning(f"Pushover {r.status_code}: {r.text}")
+        except Exception as e:
+            log.error(f"Pushover failed: {e}")
+
+    # 2. Telegram Send
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            send_telegram_message(f"🚨 *Hot Wheels IN STOCK — {platform}*\n\n{msg}", link)
+            log.info(f"🔔 Telegram alert fired → {platform}: {name} @ ₹{price}")
+            alert_sent = True
+        except Exception as e:
+            log.error(f"Telegram alert failed: {e}")
+
+    if alert_sent and not force:
+        ALERTED.add(key)
+        OUT_OF_STOCK.discard(key)
 
 
 def mark_oos(platform: str, name: str) -> None:
@@ -376,17 +416,46 @@ async def scan_blinkit(ctx: BrowserContext) -> list[Product]:
                 'input[placeholder*="pincode" i]'
             )
             if loc_input:
-                log.info(f"  {platform}: typing pincode {PINCODE} in location field")
+                log.info(f"  {platform}: typing location {AREA_NAME} in location field")
                 await loc_input.click()
                 await page.wait_for_timeout(500)
                 await loc_input.fill(AREA_NAME)
-                await page.wait_for_timeout(2500)
-                # Use keyboard to select first suggestion (avoids hidden element issues)
-                await page.keyboard.press("ArrowDown")
-                await page.wait_for_timeout(300)
-                await page.keyboard.press("Enter")
-                log.info(f"  {platform}: selected location via keyboard")
                 await page.wait_for_timeout(3000)
+                
+                # Attempt to click the suggestion directly based on AREA_NAME words
+                clicked = False
+                parts = [p.strip() for p in AREA_NAME.split(",") if p.strip()]
+                selectors = []
+                if parts:
+                    first_part = parts[0]
+                    selectors.append(f'text="{first_part}"')
+                    selectors.append(f'div:has-text("{first_part}")')
+                selectors.extend([
+                    'text="Karnataka"',
+                    'text="Bangalore"',
+                    'text="Bengaluru"',
+                    'div:has-text("Karnataka")',
+                ])
+                
+                for sel in selectors:
+                    try:
+                        el = await page.query_selector(sel)
+                        if el:
+                            log.info(f"  {platform}: clicking location suggestion: {sel}")
+                            await el.click(timeout=3000)
+                            clicked = True
+                            break
+                    except Exception:
+                        pass
+                
+                if not clicked:
+                    # Keyboard fallback
+                    log.info(f"  {platform}: fallback to selecting location via keyboard")
+                    await page.keyboard.press("ArrowDown")
+                    await page.wait_for_timeout(300)
+                    await page.keyboard.press("Enter")
+                
+                await page.wait_for_timeout(4000)
             else:
                 # Fallback: try Detect my location button
                 for sel in [
@@ -694,9 +763,9 @@ async def main() -> None:
     log.info("🛒 Platforms: Blinkit")
     
     if DRY_RUN:
-        log.info("🧪 DRY RUN MODE — no Pushover alerts will be sent")
-    elif not PUSHOVER_USER_KEY or not PUSHOVER_APP_TOKEN:
-        log.error("PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN must be set when DRY_RUN is false.")
+        log.info("🧪 DRY RUN MODE — no alerts will be sent")
+    elif (not PUSHOVER_USER_KEY or not PUSHOVER_APP_TOKEN) and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
+        log.error("Either Pushover credentials (PUSHOVER_USER_KEY + PUSHOVER_APP_TOKEN) or Telegram credentials (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID) must be set when DRY_RUN is false.")
         sys.exit(1)
 
     # ── Send startup notification ────────────────────────────────
