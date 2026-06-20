@@ -37,6 +37,13 @@ PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "arx7awfi39mtc9d543afr
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_TO_NUMBER   = os.environ.get("TWILIO_TO_NUMBER")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
+
 LATITUDE   = float(os.environ.get("LATITUDE",  "12.924674"))
 LONGITUDE  = float(os.environ.get("LONGITUDE", "77.694803"))
 PINCODE    = os.environ.get("PINCODE", "560066")
@@ -77,7 +84,7 @@ class Product:
     image_url:  str = ""
 
 # =====================================================================
-# 🔔  ALERTS (Pushover & Telegram)
+# 🔔  ALERTS (Pushover, Telegram, Discord, Twilio SMS)
 # =====================================================================
 def send_telegram_message(text: str, link: Optional[str] = None) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -99,6 +106,39 @@ def send_telegram_message(text: str, link: Optional[str] = None) -> None:
     except Exception as e:
         log.error(f"Telegram failed: {e}")
 
+def send_discord_webhook(text: str, link: Optional[str] = None) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    formatted_text = text
+    if link:
+        formatted_text = f"{text}\n\n🔗 [Open App / Buy Now]({link})"
+    payload = {
+        "content": formatted_text
+    }
+    try:
+        r = http_requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        if r.status_code not in [200, 204]:
+            log.warning(f"Discord API {r.status_code}: {r.text}")
+    except Exception as e:
+        log.error(f"Discord failed: {e}")
+
+def send_twilio_sms(text: str) -> None:
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_TO_NUMBER or not TWILIO_FROM_NUMBER:
+        return
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    data = {
+        "To": TWILIO_TO_NUMBER,
+        "From": TWILIO_FROM_NUMBER,
+        "Body": text
+    }
+    try:
+        r = http_requests.post(url, data=data, auth=auth, timeout=10)
+        if r.status_code not in [200, 201]:
+            log.warning(f"Twilio API {r.status_code}: {r.text}")
+    except Exception as e:
+        log.error(f"Twilio failed: {e}")
+
 def send_alert(platform: str, name: str, price: float | str, link: str, *, force: bool = False) -> None:
     key = f"{platform.lower()}_{name.lower()}"
     if key in ALERTED and not force:
@@ -110,6 +150,10 @@ def send_alert(platform: str, name: str, price: float | str, link: str, *, force
         log.info(f"[DRY RUN] 🔔 Would alert → {platform}: {name} @ ₹{price}")
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             log.info(f"[DRY RUN] Would send Telegram alert → {msg}")
+        if DISCORD_WEBHOOK_URL:
+            log.info(f"[DRY RUN] Would send Discord alert → {msg}")
+        if TWILIO_ACCOUNT_SID:
+            log.info(f"[DRY RUN] Would send Twilio SMS alert → {msg}")
         if not force:
             ALERTED.add(key)
         return
@@ -150,6 +194,25 @@ def send_alert(platform: str, name: str, price: float | str, link: str, *, force
             alert_sent = True
         except Exception as e:
             log.error(f"Telegram alert failed: {e}")
+
+    # 3. Discord Send
+    if DISCORD_WEBHOOK_URL:
+        try:
+            send_discord_webhook(f"🚨 **Hot Wheels IN STOCK — {platform}**\n\n{msg}", link)
+            log.info(f"🔔 Discord alert fired → {platform}: {name} @ ₹{price}")
+            alert_sent = True
+        except Exception as e:
+            log.error(f"Discord alert failed: {e}")
+
+    # 4. Twilio SMS Send
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        try:
+            sms_text = f"Hot Wheels IN STOCK — {platform}\n🏎️ {name}\n💰 ₹{price}\n🏪 {platform}\n🔗 Buy: {link}"
+            send_twilio_sms(sms_text)
+            log.info(f"🔔 Twilio SMS alert fired → {platform}: {name} @ ₹{price}")
+            alert_sent = True
+        except Exception as e:
+            log.error(f"Twilio alert failed: {e}")
 
     if alert_sent and not force:
         ALERTED.add(key)
@@ -762,10 +825,16 @@ async def main() -> None:
     log.info(f"🖥️  Headless: {HEADLESS}")
     log.info("🛒 Platforms: Blinkit")
     
+    # Check if any notification method is configured
+    has_pushover = bool(PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN)
+    has_telegram = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    has_discord  = bool(DISCORD_WEBHOOK_URL)
+    has_twilio   = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_TO_NUMBER and TWILIO_FROM_NUMBER)
+
     if DRY_RUN:
         log.info("🧪 DRY RUN MODE — no alerts will be sent")
-    elif (not PUSHOVER_USER_KEY or not PUSHOVER_APP_TOKEN) and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
-        log.error("Either Pushover credentials (PUSHOVER_USER_KEY + PUSHOVER_APP_TOKEN) or Telegram credentials (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID) must be set when DRY_RUN is false.")
+    elif not (has_pushover or has_telegram or has_discord or has_twilio):
+        log.error("No notification credentials found. You must configure at least one alerting method: Pushover, Telegram, Discord, or Twilio SMS when DRY_RUN is false.")
         sys.exit(1)
 
     # ── Send startup notification ────────────────────────────────
