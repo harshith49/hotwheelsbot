@@ -72,6 +72,7 @@ log = logging.getLogger("hotwheels")
 # =====================================================================
 ALERTED: set[str]       = set()
 OUT_OF_STOCK: set[str]  = set()
+MISSING_COUNT: dict[str, int] = {}
 
 # =====================================================================
 # 📦  DATA MODEL
@@ -228,6 +229,7 @@ def mark_oos(platform: str, name: str) -> None:
         log.info(f"↩️  {platform}: '{name}' went OOS — will re-alert on restock")
         OUT_OF_STOCK.add(key)
         ALERTED.discard(key)
+        MISSING_COUNT.pop(key, None)
 
 
 class BlinkitBlockedException(Exception):
@@ -772,14 +774,24 @@ async def run_scan(ctx: BrowserContext) -> None:
         else:
             mark_oos(product.platform, product.name)
 
+    # Reset missing counts for items seen in this scan
+    for key in seen_in_scan:
+        if key in MISSING_COUNT:
+            MISSING_COUNT[key] = 0
+
     # Clean up keys that were previously ALERTED but have disappeared from search results
-    platform = "blinkit"
-    for alerted_key in list(ALERTED):
-        if alerted_key.startswith(f"{platform}_") and alerted_key not in seen_in_scan:
-            name = alerted_key[len(platform) + 1:]  # strip platform prefix plus underscore
-            log.info(f"↩️  {platform.capitalize()}: '{name}' disappeared from search results — marking as OOS to allow restock alerts")
-            OUT_OF_STOCK.add(alerted_key)
-            ALERTED.discard(alerted_key)
+    # We only do this if the scan successfully loaded and returned at least one product (total_found > 0)
+    if total_found > 0:
+        platform = "blinkit"
+        for alerted_key in list(ALERTED):
+            if alerted_key.startswith(f"{platform}_") and alerted_key not in seen_in_scan:
+                MISSING_COUNT[alerted_key] = MISSING_COUNT.get(alerted_key, 0) + 1
+                if MISSING_COUNT[alerted_key] >= 5:
+                    name = alerted_key[len(platform) + 1:]  # strip platform prefix plus underscore
+                    log.info(f"↩️  {platform.capitalize()}: '{name}' disappeared from search results for 5 consecutive scans — marking as OOS")
+                    OUT_OF_STOCK.add(alerted_key)
+                    ALERTED.discard(alerted_key)
+                    MISSING_COUNT.pop(alerted_key, None)
 
     log.info(
         f"═══ Scan done: {total_found} products, "
