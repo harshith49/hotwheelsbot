@@ -760,14 +760,26 @@ async def run_scan(ctx: BrowserContext) -> None:
 
     total_found = 0
     total_in_stock = 0
+    seen_in_scan = set()
 
     for product in results:
         total_found += 1
+        key = f"{product.platform.lower()}_{product.name.lower()}"
+        seen_in_scan.add(key)
         if product.in_stock:
             total_in_stock += 1
             send_alert(product.platform, product.name, product.price, product.link)
         else:
             mark_oos(product.platform, product.name)
+
+    # Clean up keys that were previously ALERTED but have disappeared from search results
+    platform = "blinkit"
+    for alerted_key in list(ALERTED):
+        if alerted_key.startswith(f"{platform}_") and alerted_key not in seen_in_scan:
+            name = alerted_key[len(platform) + 1:]  # strip platform prefix plus underscore
+            log.info(f"↩️  {platform.capitalize()}: '{name}' disappeared from search results — marking as OOS to allow restock alerts")
+            OUT_OF_STOCK.add(alerted_key)
+            ALERTED.discard(alerted_key)
 
     log.info(
         f"═══ Scan done: {total_found} products, "
