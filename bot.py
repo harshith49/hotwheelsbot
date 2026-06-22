@@ -1028,6 +1028,14 @@ async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
 
         # ── Step 4: Extract from DOM ─────────────────────────────
         products = await _dom_fallback_bigbasket(page, SEARCH_QUERY)
+        if not products:
+            try:
+                title = await page.title()
+                body_text = await page.inner_text("body")
+                snippet = body_text[:400].replace('\n', ' | ').replace('\r', '')
+                log.warning(f"  {platform} empty results. Title: '{title}'. Snippet: '{snippet}'")
+            except Exception as e:
+                log.warning(f"  {platform} failed to extract debug info: {e}")
 
     except BlinkitBlockedException:
         raise
