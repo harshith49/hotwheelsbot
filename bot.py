@@ -332,7 +332,7 @@ async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
             log.warning(f"Failed to fetch {proto} from Proxyscrape: {e}")
 
     # Deduplicate proxies
-    unique_proxies = list(set(all_proxies))
+    unique_proxies = list(set(all_proxies))[:25]
     if not unique_proxies:
         log.warning("No proxies found from either Geonode or Proxyscrape.")
         return None

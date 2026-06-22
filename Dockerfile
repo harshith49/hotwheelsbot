@@ -31,6 +31,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN playwright install chromium
 
+ENV PYTHONUNBUFFERED=1
+
 COPY . .
 
-CMD ["xvfb-run", "--server-args=-screen 0 1920x1080x24", "python", "bot.py"]
+CMD ["xvfb-run", "--server-args=-screen 0 1920x1080x24", "python", "-u", "bot.py"]
