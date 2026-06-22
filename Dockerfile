@@ -31,8 +31,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN playwright install chromium
 
+# Create X11 virtual display socket directory with correct permissions to prevent lock/start hangs
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
 ENV PYTHONUNBUFFERED=1
 
 COPY . .
 
-CMD ["xvfb-run", "--server-args=-screen 0 1920x1080x24", "python", "-u", "bot.py"]
+CMD ["xvfb-run", "-a", "-e", "/dev/stdout", "--server-args=-screen 0 1920x1080x24", "python", "-u", "bot.py"]
