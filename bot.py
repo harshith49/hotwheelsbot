@@ -1047,11 +1047,16 @@ async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
 async def run_scan(ctx: BrowserContext) -> None:
     log.info("═══ Starting scan cycle ═══")
 
+    blinkit_blocked = False
+    bb_blocked = False
+
     # Scrape Blinkit
     try:
         blinkit_results = await scan_blinkit(ctx)
-    except BlinkitBlockedException:
-        raise
+    except BlinkitBlockedException as e:
+        log.warning(f"  Blinkit was blocked: {e}")
+        blinkit_blocked = True
+        blinkit_results = []
     except Exception as e:
         log.error(f"  Blinkit crashed: {e}")
         blinkit_results = []
@@ -1059,8 +1064,10 @@ async def run_scan(ctx: BrowserContext) -> None:
     # Scrape Big Basket
     try:
         bb_results = await scan_bigbasket(ctx)
-    except BlinkitBlockedException:
-        raise
+    except BlinkitBlockedException as e:
+        log.warning(f"  Big Basket was blocked: {e}")
+        bb_blocked = True
+        bb_results = []
     except Exception as e:
         log.error(f"  Big Basket crashed: {e}")
         bb_results = []
@@ -1120,6 +1127,9 @@ async def run_scan(ctx: BrowserContext) -> None:
         f"{total_in_stock} in stock. "
         f"Next in {SCAN_INTERVAL}s ═══\n"
     )
+
+    if blinkit_blocked or bb_blocked:
+        raise BlinkitBlockedException("One or more platforms were blocked by Cloudflare/Akamai during this scan cycle")
 
 # =====================================================================
 # 🏥  HEALTH CHECK HTTP SERVER  — keeps Railway happy
