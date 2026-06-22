@@ -38,4 +38,6 @@ ENV PYTHONUNBUFFERED=1
 
 COPY . .
 
-CMD ["xvfb-run", "-a", "-e", "/dev/stdout", "--server-args=-screen 0 1920x1080x24", "python", "-u", "bot.py"]
+RUN chmod +x start.sh
+
+CMD ["./start.sh"]
