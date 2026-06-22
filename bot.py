@@ -73,7 +73,6 @@ log = logging.getLogger("hotwheels")
 ALERTED: set[str]       = set()
 OUT_OF_STOCK: set[str]  = set()
 MISSING_COUNT: dict[str, int] = {}
-IS_FIRST_SCAN: bool     = True
 
 # =====================================================================
 # 📦  DATA MODEL
@@ -1037,7 +1036,6 @@ async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
 # ⏱️  MAIN SCAN LOOP
 # =====================================================================
 async def run_scan(ctx: BrowserContext) -> None:
-    global IS_FIRST_SCAN
     log.info("═══ Starting scan cycle ═══")
 
     # Scrape Blinkit
@@ -1070,15 +1068,9 @@ async def run_scan(ctx: BrowserContext) -> None:
         seen_in_scan.add(key)
         if product.in_stock:
             total_in_stock += 1
-            if IS_FIRST_SCAN:
-                ALERTED.add(key)
-            else:
-                send_alert(product.platform, product.name, product.price, product.link)
+            send_alert(product.platform, product.name, product.price, product.link)
         else:
-            if IS_FIRST_SCAN:
-                OUT_OF_STOCK.add(key)
-            else:
-                mark_oos(product.platform, product.name, product.price, product.link)
+            mark_oos(product.platform, product.name, product.price, product.link)
 
     # Reset missing counts for items seen in this scan
     for key in seen_in_scan:
@@ -1113,8 +1105,6 @@ async def run_scan(ctx: BrowserContext) -> None:
                     ALERTED.discard(alerted_key)
                     MISSING_COUNT.pop(alerted_key, None)
                     send_oos_alert(platform.capitalize(), name, "N/A", "https://www.bigbasket.com")
-
-    IS_FIRST_SCAN = False
 
     log.info(
         f"═══ Scan done: {total_found} products, "
