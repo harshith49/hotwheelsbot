@@ -49,12 +49,12 @@ TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 
 LATITUDE   = float(os.environ.get("LATITUDE",  "12.924674"))
 LONGITUDE  = float(os.environ.get("LONGITUDE", "77.694803"))
-PINCODE    = os.environ.get("PINCODE", "560066")
+PINCODE    = os.environ.get("PINCODE", "560103")
 AREA_NAME  = os.environ.get("AREA_NAME", "Bellandur, Bangalore")
 
 SCAN_INTERVAL    = int(os.environ.get("SCAN_INTERVAL", "60"))
 SEARCH_QUERY     = os.environ.get("SEARCH_QUERY", "hot wheels")
-HEADLESS         = os.environ.get("HEADLESS", "true").lower() == "true"
+HEADLESS         = os.environ.get("HEADLESS", "false").lower() == "true"
 DRY_RUN          = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 # =====================================================================
@@ -73,6 +73,7 @@ log = logging.getLogger("hotwheels")
 ALERTED: set[str]       = set()
 OUT_OF_STOCK: set[str]  = set()
 MISSING_COUNT: dict[str, int] = {}
+IS_FIRST_SCAN: bool     = True
 
 # =====================================================================
 # 📦  DATA MODEL
@@ -223,13 +224,77 @@ def send_alert(platform: str, name: str, price: float | str, link: str, *, force
         OUT_OF_STOCK.discard(key)
 
 
-def mark_oos(platform: str, name: str) -> None:
+def send_oos_alert(platform: str, name: str, price: float | str, link: str) -> None:
+    msg = f"🏎️ {name}\n💰 ₹{price}\n🏪 {platform} — Went Out of Stock!"
+
+    if DRY_RUN:
+        log.info(f"[DRY RUN] 🔔 Would alert OOS → {platform}: {name} @ ₹{price}")
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            log.info(f"[DRY RUN] Would send Telegram OOS alert → {msg}")
+        if DISCORD_WEBHOOK_URL:
+            log.info(f"[DRY RUN] Would send Discord OOS alert → {msg}")
+        if TWILIO_ACCOUNT_SID:
+            log.info(f"[DRY RUN] Would send Twilio SMS OOS alert → {msg}")
+        return
+
+    # 1. Pushover Send
+    if PUSHOVER_APP_TOKEN and PUSHOVER_USER_KEY:
+        payload = {
+            "token":     PUSHOVER_APP_TOKEN,
+            "user":      PUSHOVER_USER_KEY,
+            "title":     f"↩️ Hot Wheels OUT OF STOCK — {platform}",
+            "message":   msg,
+            "url":       link,
+            "url_title": "Open App",
+            "priority":  0,
+        }
+        try:
+            r = http_requests.post(
+                "https://api.pushover.net/1/messages.json",
+                data=payload,
+                timeout=10,
+            )
+            if r.status_code == 200:
+                log.info(f"🔔 Pushover OOS alert fired → {platform}: {name} @ ₹{price}")
+            else:
+                log.warning(f"Pushover OOS {r.status_code}: {r.text}")
+        except Exception as e:
+            log.error(f"Pushover OOS failed: {e}")
+
+    # 2. Telegram Send
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            send_telegram_message(f"↩️ *Hot Wheels OUT OF STOCK — {platform}*\n\n{msg}", link)
+            log.info(f"🔔 Telegram OOS alert fired → {platform}: {name} @ ₹{price}")
+        except Exception as e:
+            log.error(f"Telegram OOS failed: {e}")
+
+    # 3. Discord Send
+    if DISCORD_WEBHOOK_URL:
+        try:
+            send_discord_webhook(f"↩️ **Hot Wheels OUT OF STOCK — {platform}**\n\n{msg}", link)
+            log.info(f"🔔 Discord OOS alert fired → {platform}: {name} @ ₹{price}")
+        except Exception as e:
+            log.error(f"Discord OOS failed: {e}")
+
+    # 4. Twilio SMS Send
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        try:
+            sms_text = f"Hot Wheels OUT OF STOCK — {platform}\n🏎️ {name}\n💰 ₹{price}\n🏪 {platform}\n🔗 Buy: {link}"
+            send_twilio_sms(sms_text)
+            log.info(f"🔔 Twilio SMS OOS alert fired → {platform}: {name} @ ₹{price}")
+        except Exception as e:
+            log.error(f"Twilio OOS failed: {e}")
+
+
+def mark_oos(platform: str, name: str, price: float | str, link: str) -> None:
     key = f"{platform.lower()}_{name.lower()}"
     if key in ALERTED and key not in OUT_OF_STOCK:
         log.info(f"↩️  {platform}: '{name}' went OOS — will re-alert on restock")
         OUT_OF_STOCK.add(key)
         ALERTED.discard(key)
         MISSING_COUNT.pop(key, None)
+        send_oos_alert(platform, name, price, link)
 
 
 class BlinkitBlockedException(Exception):
@@ -364,10 +429,11 @@ class BrowserManager:
         
         # Dynamically fetch a working proxy
         proxy_server = None
-        try:
-            proxy_server = await fetch_working_proxy(self._pw)
-        except Exception as e:
-            log.error(f"Error checking proxies: {e}")
+        if os.environ.get("DISABLE_PROXY", "false").lower() != "true":
+            try:
+                proxy_server = await fetch_working_proxy(self._pw)
+            except Exception as e:
+                log.error(f"Error checking proxies: {e}")
             
         launch_args = [
             "--disable-blink-features=AutomationControlled",
@@ -746,19 +812,253 @@ async def _dom_fallback(page: Page, platform: str, query: str) -> list[Product]:
 
     return products
 
+
+# =====================================================================
+#   🧩  DOM FALLBACK  — works for Big Basket
+# =====================================================================
+async def _dom_fallback_bigbasket(page: Page, query: str) -> list[Product]:
+    """Scrape visible Big Basket product cards from the DOM."""
+    import re
+    products: list[Product] = []
+    try:
+        # First group links by pid to handle duplicate card elements and get the best name
+        links = await page.query_selector_all('a[href*="/pd/"]')
+        pid_to_link = {}
+        for link in links:
+            href = await link.get_attribute("href") or ""
+            if not href:
+                continue
+            m = re.search(r'/pd/(\d+)/', href)
+            if not m:
+                continue
+            pid = m.group(1)
+            name = (await link.inner_text()).strip()
+            
+            if pid not in pid_to_link:
+                pid_to_link[pid] = (link, href, name)
+            else:
+                existing_link, existing_href, existing_name = pid_to_link[pid]
+                if not existing_name and name:
+                    pid_to_link[pid] = (link, href, name)
+
+        for pid, (link, href, name) in pid_to_link.items():
+            # Get parent card container
+            card_info = await page.evaluate('''(el) => {
+                let parent = el.parentElement;
+                while (parent && parent.tagName !== 'BODY') {
+                    let text = parent.innerText || "";
+                    if (text.includes("₹") && (text.toLowerCase().includes("add") || text.toLowerCase().includes("out of stock") || text.toLowerCase().includes("notify") || text.toLowerCase().includes("coming soon"))) {
+                        return { text: text };
+                    }
+                    parent = parent.parentElement;
+                }
+                return null;
+            }''', link)
+            
+            if not card_info:
+                continue
+                
+            text = card_info["text"]
+            tl = text.lower()
+            
+            name = name.replace("\n", " ").strip()
+            IGNORE_NAMES = {"out of stock", "notify me", "coming soon", "add", "added", "sold out"}
+            if name.lower() in IGNORE_NAMES:
+                name = ""
+
+            if not name:
+                m_slug = re.search(r'/pd/\d+/([^/?#]+)', href)
+                if m_slug:
+                    slug = m_slug.group(1)
+                    name = slug.replace('-', ' ').strip()
+                    name = " ".join(w.capitalize() for w in name.split())
+                else:
+                    name = "Hot Wheels Product"
+            
+            if "hot wheels" not in name.lower() and "hotwheels" not in name.lower() and "hot wheels" not in tl:
+                continue
+                
+            prices = []
+            for m_price in re.finditer(r'₹\s*(\d+(?:\.\d+)?)', text):
+                val = m_price.group(1)
+                idx = m_price.end()
+                suffix = text[idx:idx+15].lower()
+                if "off" in suffix:
+                    continue
+                prices.append(float(val) if '.' in val else int(val))
+            price = min(prices) if prices else "N/A"
+            
+            in_stock = ("add" in tl) and ("out of stock" not in tl) and ("notify" not in tl) and ("coming soon" not in tl)
+            
+            full_link = href if href.startswith("http") else f"https://www.bigbasket.com{href}"
+            products.append(Product(
+                platform="Big Basket",
+                name=name,
+                price=price,
+                in_stock=in_stock,
+                product_id=pid,
+                link=full_link,
+            ))
+    except Exception as e:
+        log.warning(f"  Big Basket DOM fallback error: {e}")
+    return products
+
+
+# =====================================================================
+#   🛒  BIG BASKET SCRAPER
+# =====================================================================
+async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
+    platform = "Big Basket"
+    log.info(f"🟡 Scanning {platform}...")
+
+    products: list[Product] = []
+    page: Optional[Page] = None
+
+    try:
+        page = await ctx.new_page()
+
+        # ── Step 1: Go to homepage to pass Cloudflare/Akamai ──────
+        log.debug(f"  {platform}: loading homepage...")
+        await page.goto("https://www.bigbasket.com", wait_until="domcontentloaded", timeout=45_000)
+        await page.wait_for_timeout(3000)
+
+        # Check if blocked
+        try:
+            body_text = await page.inner_text("body")
+            if "blocked" in body_text.lower() or "access denied" in body_text.lower() or "cloudflare" in body_text.lower():
+                raise BlinkitBlockedException("Big Basket blocked by Cloudflare/Akamai")
+        except BlinkitBlockedException:
+            raise
+        except Exception:
+            pass
+
+        # ── Step 2: Set location via pincode ──────────────────────
+        try:
+            locator = page.locator('button:has-text("Select Location"), button:has-text("Delivery in")')
+            count = await locator.count()
+            visible_locator = None
+            for i in range(count):
+                loc = locator.nth(i)
+                if await loc.is_visible():
+                    visible_locator = loc
+                    
+            if visible_locator:
+                log.info(f"  {platform}: clicking location button")
+                await visible_locator.click()
+                await page.wait_for_timeout(3000)
+                
+                input_locator = page.locator('input[placeholder*="Search for area"]')
+                input_count = await input_locator.count()
+                visible_input = None
+                for i in range(input_count):
+                    loc = input_locator.nth(i)
+                    if await loc.is_visible():
+                        visible_input = loc
+                        
+                if visible_input:
+                    log.info(f"  {platform}: filling pincode {PINCODE}")
+                    await visible_input.click()
+                    await visible_input.fill(PINCODE)
+                    await page.wait_for_timeout(4000)
+                    
+                    clicked = await page.evaluate('''(pincode) => {
+                        let sug = Array.from(document.querySelectorAll('ul li, li, div[class*="suggestion"], div[class*="List"] div, div[class*="item"]')).find(el => {
+                            let t = (el.innerText || "").toLowerCase();
+                            return t.includes(pincode);
+                        });
+                        if (sug) {
+                            sug.click();
+                            return true;
+                        }
+                        let firstLi = document.querySelector('ul li, li');
+                        if (firstLi) {
+                            firstLi.click();
+                            return true;
+                        }
+                        return false;
+                    }''', PINCODE)
+                    if clicked:
+                        log.info(f"  {platform}: location suggestion clicked, waiting for update...")
+                        await page.wait_for_timeout(5000)
+        except Exception as e:
+            log.warning(f"  {platform}: location setup error (continuing): {e}")
+
+        # ── Step 3: Navigate/Search using homepage input ──────────
+        try:
+            log.info(f"  {platform}: searching via homepage input box")
+            search_locator = page.locator('input[placeholder*="Search for Products"], input[placeholder*="Search for products"], input[placeholder*="Search 18000"]')
+            search_count = await search_locator.count()
+            visible_search = None
+            for i in range(search_count):
+                loc = search_locator.nth(i)
+                if await loc.is_visible():
+                    visible_search = loc
+            
+            if visible_search:
+                await visible_search.click()
+                await visible_search.fill(SEARCH_QUERY)
+                await page.wait_for_timeout(1000)
+                await page.keyboard.press("Enter")
+            else:
+                log.info(f"  {platform}: search input not found, navigating directly")
+                q = SEARCH_QUERY.replace(" ", "+")
+                await page.goto(f"https://www.bigbasket.com/search/?q={q}", wait_until="domcontentloaded", timeout=45_000)
+            
+            await page.wait_for_timeout(8000)
+        except Exception as e:
+            log.error(f"  {platform}: search error: {e}")
+
+        # Check block again on search page
+        try:
+            body_text = await page.inner_text("body")
+            if "blocked" in body_text.lower() or "access denied" in body_text.lower() or "cloudflare" in body_text.lower():
+                raise BlinkitBlockedException("Big Basket search blocked by Cloudflare/Akamai")
+        except BlinkitBlockedException:
+            raise
+        except Exception:
+            pass
+
+        # ── Step 4: Extract from DOM ─────────────────────────────
+        products = await _dom_fallback_bigbasket(page, SEARCH_QUERY)
+
+    except BlinkitBlockedException:
+        raise
+    except Exception as e:
+        log.error(f"  {platform} error: {e}")
+    finally:
+        if page and not page.is_closed():
+            await page.close()
+
+    log.info(f"  {platform}: {len(products)} Hot Wheels found")
+    return products
+
+
 # =====================================================================
 # ⏱️  MAIN SCAN LOOP
 # =====================================================================
 async def run_scan(ctx: BrowserContext) -> None:
+    global IS_FIRST_SCAN
     log.info("═══ Starting scan cycle ═══")
 
+    # Scrape Blinkit
     try:
-        results = await scan_blinkit(ctx)
+        blinkit_results = await scan_blinkit(ctx)
     except BlinkitBlockedException:
         raise
     except Exception as e:
         log.error(f"  Blinkit crashed: {e}")
-        return
+        blinkit_results = []
+
+    # Scrape Big Basket
+    try:
+        bb_results = await scan_bigbasket(ctx)
+    except BlinkitBlockedException:
+        raise
+    except Exception as e:
+        log.error(f"  Big Basket crashed: {e}")
+        bb_results = []
+
+    results = blinkit_results + bb_results
 
     total_found = 0
     total_in_stock = 0
@@ -770,9 +1070,15 @@ async def run_scan(ctx: BrowserContext) -> None:
         seen_in_scan.add(key)
         if product.in_stock:
             total_in_stock += 1
-            send_alert(product.platform, product.name, product.price, product.link)
+            if IS_FIRST_SCAN:
+                ALERTED.add(key)
+            else:
+                send_alert(product.platform, product.name, product.price, product.link)
         else:
-            mark_oos(product.platform, product.name)
+            if IS_FIRST_SCAN:
+                OUT_OF_STOCK.add(key)
+            else:
+                mark_oos(product.platform, product.name, product.price, product.link)
 
     # Reset missing counts for items seen in this scan
     for key in seen_in_scan:
@@ -780,18 +1086,35 @@ async def run_scan(ctx: BrowserContext) -> None:
             MISSING_COUNT[key] = 0
 
     # Clean up keys that were previously ALERTED but have disappeared from search results
-    # We only do this if the scan successfully loaded and returned at least one product (total_found > 0)
-    if total_found > 0:
+    blinkit_found = sum(1 for p in blinkit_results)
+    if blinkit_found > 0:
         platform = "blinkit"
         for alerted_key in list(ALERTED):
             if alerted_key.startswith(f"{platform}_") and alerted_key not in seen_in_scan:
                 MISSING_COUNT[alerted_key] = MISSING_COUNT.get(alerted_key, 0) + 1
                 if MISSING_COUNT[alerted_key] >= 5:
-                    name = alerted_key[len(platform) + 1:]  # strip platform prefix plus underscore
+                    name = alerted_key[len(platform) + 1:]
                     log.info(f"↩️  {platform.capitalize()}: '{name}' disappeared from search results for 5 consecutive scans — marking as OOS")
                     OUT_OF_STOCK.add(alerted_key)
                     ALERTED.discard(alerted_key)
                     MISSING_COUNT.pop(alerted_key, None)
+                    send_oos_alert(platform.capitalize(), name, "N/A", f"https://blinkit.com/s/?q={SEARCH_QUERY.replace(' ', '+')}")
+
+    bb_found = sum(1 for p in bb_results)
+    if bb_found > 0:
+        platform = "big basket"
+        for alerted_key in list(ALERTED):
+            if alerted_key.startswith(f"{platform}_") and alerted_key not in seen_in_scan:
+                MISSING_COUNT[alerted_key] = MISSING_COUNT.get(alerted_key, 0) + 1
+                if MISSING_COUNT[alerted_key] >= 5:
+                    name = alerted_key[len(platform) + 1:]
+                    log.info(f"↩️  {platform.capitalize()}: '{name}' disappeared from search results for 5 consecutive scans — marking as OOS")
+                    OUT_OF_STOCK.add(alerted_key)
+                    ALERTED.discard(alerted_key)
+                    MISSING_COUNT.pop(alerted_key, None)
+                    send_oos_alert(platform.capitalize(), name, "N/A", "https://www.bigbasket.com")
+
+    IS_FIRST_SCAN = False
 
     log.info(
         f"═══ Scan done: {total_found} products, "
@@ -850,7 +1173,7 @@ async def main() -> None:
     log.info(f"🔍 Query: '{SEARCH_QUERY}'")
     log.info(f"⏱️  Interval: {SCAN_INTERVAL}s")
     log.info(f"🖥️  Headless: {HEADLESS}")
-    log.info("🛒 Platforms: Blinkit")
+    log.info("🛒 Platforms: Blinkit, Big Basket")
     
     # Check if any notification method is configured
     has_pushover = bool(PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN)
@@ -863,15 +1186,6 @@ async def main() -> None:
     elif not (has_pushover or has_telegram or has_discord or has_twilio):
         log.error("No notification credentials found. You must configure at least one alerting method: Pushover, Telegram, Discord, or Twilio SMS when DRY_RUN is false.")
         sys.exit(1)
-
-    # ── Send startup notification ────────────────────────────────
-    send_alert(
-        "BOT STATUS",
-        f"Hot Wheels Alert Bot is LIVE — scanning Blinkit every {SCAN_INTERVAL}s",
-        "0",
-        "https://railway.app",
-        force=True,
-    )
 
     # ── Start browser ────────────────────────────────────────────
     mgr = BrowserManager()

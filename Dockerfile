@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y \
     libgbm1 \
     libgtk-3-0 \
     libasound2 \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -32,4 +33,4 @@ RUN playwright install chromium
 
 COPY . .
 
-CMD ["python", "bot.py"]
+CMD ["xvfb-run", "--server-args=-screen 0 1920x1080x24", "python", "bot.py"]
