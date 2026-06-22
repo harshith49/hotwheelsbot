@@ -985,13 +985,22 @@ async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
         # ── Step 3: Navigate/Search using homepage input ──────────
         try:
             log.info(f"  {platform}: searching via homepage input box")
-            search_locator = page.locator('input[placeholder*="Search for Products"], input[placeholder*="Search for products"], input[placeholder*="Search 18000"]')
-            search_count = await search_locator.count()
+            
+            selectors = [
+                'input[placeholder*="Search for Products"]',
+                'input[placeholder*="Search for products"]',
+                'input[placeholder*="Search 18000"]',
+                'input[placeholder*="Search"]',
+                'input[id*="search"]'
+            ]
+            combined_selector = ", ".join(selectors)
+            
             visible_search = None
-            for i in range(search_count):
-                loc = search_locator.nth(i)
-                if await loc.is_visible():
-                    visible_search = loc
+            try:
+                # Wait up to 15 seconds for the React search box to appear in the DOM and be visible
+                visible_search = await page.wait_for_selector(combined_selector, state="visible", timeout=15000)
+            except Exception:
+                pass
             
             if visible_search:
                 await visible_search.click()
