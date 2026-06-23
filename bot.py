@@ -829,101 +829,78 @@ async def _dom_fallback(page: Page, platform: str, query: str) -> list[Product]:
 
 
 # =====================================================================
-#   🧩  DOM FALLBACK  — works for Big Basket
+#   🧩  DOM FALLBACK  — works for Zepto
 # =====================================================================
-async def _dom_fallback_bigbasket(page: Page, query: str) -> list[Product]:
-    """Scrape visible Big Basket product cards from the DOM."""
+async def _dom_fallback_zepto(page: Page, query: str) -> list[Product]:
+    """Scrape visible Zepto product cards from the DOM."""
     import re
     products: list[Product] = []
     try:
-        # First group links by pid to handle duplicate card elements and get the best name
-        links = await page.query_selector_all('a[href*="/pd/"]')
-        pid_to_link = {}
+        links = await page.query_selector_all('a[href*="/pn/"]')
+        seen_pids = set()
+        
         for link in links:
             href = await link.get_attribute("href") or ""
-            if not href:
-                continue
-            m = re.search(r'/pd/(\d+)/', href)
-            if not m:
-                continue
-            pid = m.group(1)
-            name = (await link.inner_text()).strip()
-            
-            if pid not in pid_to_link:
-                pid_to_link[pid] = (link, href, name)
-            else:
-                existing_link, existing_href, existing_name = pid_to_link[pid]
-                if not existing_name and name:
-                    pid_to_link[pid] = (link, href, name)
-
-        for pid, (link, href, name) in pid_to_link.items():
-            # Get parent card container
-            card_info = await page.evaluate('''(el) => {
-                let parent = el.parentElement;
-                while (parent && parent.tagName !== 'BODY') {
-                    let text = parent.innerText || "";
-                    if (text.includes("₹") && (text.toLowerCase().includes("add") || text.toLowerCase().includes("out of stock") || text.toLowerCase().includes("notify") || text.toLowerCase().includes("coming soon"))) {
-                        return { text: text };
-                    }
-                    parent = parent.parentElement;
-                }
-                return null;
-            }''', link)
-            
-            if not card_info:
+            text = await link.inner_text()
+            if not href or not text:
                 continue
                 
-            text = card_info["text"]
+            # Extract pid from href (e.g. /pn/name/pvid/uuid)
+            m_pid = re.search(r'/pvid/([a-zA-Z0-9\-]+)', href)
+            pid = m_pid.group(1) if m_pid else f"zepto_{abs(hash(href))}"
+            
+            if pid in seen_pids:
+                continue
+            seen_pids.add(pid)
+            
             tl = text.lower()
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
             
-            name = name.replace("\n", " ").strip()
-            IGNORE_NAMES = {"out of stock", "notify me", "coming soon", "add", "added", "sold out"}
-            if name.lower() in IGNORE_NAMES:
-                name = ""
-
-            if not name:
-                m_slug = re.search(r'/pd/\d+/([^/?#]+)', href)
-                if m_slug:
-                    slug = m_slug.group(1)
-                    name = slug.replace('-', ' ').strip()
-                    name = " ".join(w.capitalize() for w in name.split())
-                else:
-                    name = "Hot Wheels Product"
-            
-            if "hot wheels" not in name.lower() and "hotwheels" not in name.lower() and "hot wheels" not in tl:
-                continue
-                
+            # Find price
             prices = []
             for m_price in re.finditer(r'₹\s*(\d+(?:\.\d+)?)', text):
                 val = m_price.group(1)
-                idx = m_price.end()
-                suffix = text[idx:idx+15].lower()
-                if "off" in suffix:
-                    continue
                 prices.append(float(val) if '.' in val else int(val))
-            price = min(prices) if prices else "N/A"
+            price = prices[0] if prices else "N/A"
             
-            in_stock = ("add" in tl) and ("out of stock" not in tl) and ("notify" not in tl) and ("coming soon" not in tl)
+            # Find name: first line that doesn't contain ADD, ₹, OFF, and is not a rating/count
+            name = ""
+            for line in lines:
+                l_line = line.lower()
+                if "add" in l_line or "₹" in l_line or "off" in l_line or re.match(r'^\d+\s*(pc|pack|set|g|kg|ml|l|min|mins)', l_line) or re.match(r'^\d+(\.\d+)?$', l_line) or re.match(r'^\(\d+(\.\d+)?[k]?[^\)]*\)$', l_line):
+                    continue
+                name = line
+                break
+                
+            if not name:
+                # Fallback to slug
+                m_slug = re.search(r'/pn/([^/]+)', href)
+                if m_slug:
+                    name = m_slug.group(1).replace('-', ' ').title()
+                else:
+                    name = "Hot Wheels Product"
+                    
+            in_stock = "add" in tl and "out of stock" not in tl and "notify" not in tl
+            full_link = f"https://www.zeptonow.com{href}"
             
-            full_link = href if href.startswith("http") else f"https://www.bigbasket.com{href}"
             products.append(Product(
-                platform="Big Basket",
+                platform="Zepto",
                 name=name,
                 price=price,
                 in_stock=in_stock,
                 product_id=pid,
-                link=full_link,
+                link=full_link
             ))
     except Exception as e:
-        log.warning(f"  Big Basket DOM fallback error: {e}")
+        log.warning(f"  Zepto DOM fallback error: {e}")
     return products
 
 
 # =====================================================================
-#   🛒  BIG BASKET SCRAPER
+#   🛒  ZEPTO SCRAPER
 # =====================================================================
-async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
-    platform = "Big Basket"
+async def scan_zepto(ctx: BrowserContext) -> list[Product]:
+    platform = "Zepto"
     log.info(f"🟡 Scanning {platform}...")
 
     products: list[Product] = []
@@ -934,67 +911,32 @@ async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
 
         # ── Step 1: Go to homepage to pass Cloudflare/Akamai ──────
         log.debug(f"  {platform}: loading homepage...")
-        await page.goto("https://www.bigbasket.com", wait_until="domcontentloaded", timeout=45_000)
+        await page.goto("https://www.zeptonow.com", wait_until="domcontentloaded", timeout=45_000)
         await page.wait_for_timeout(3000)
 
         # Check if blocked
         try:
             body_text = await page.inner_text("body")
             if "blocked" in body_text.lower() or "access denied" in body_text.lower() or "cloudflare" in body_text.lower():
-                raise BlinkitBlockedException("Big Basket blocked by Cloudflare/Akamai")
+                raise BlinkitBlockedException("Zepto blocked by Cloudflare")
         except BlinkitBlockedException:
             raise
         except Exception:
             pass
 
-        # ── Step 2: Set location via pincode ──────────────────────
+        # ── Step 2: Set location via GPS button ──────────────────
         try:
-            locator = page.locator('button:has-text("Select Location"), button:has-text("Delivery in")')
-            count = await locator.count()
-            visible_locator = None
-            for i in range(count):
-                loc = locator.nth(i)
-                if await loc.is_visible():
-                    visible_locator = loc
-                    
-            if visible_locator:
-                log.info(f"  {platform}: clicking location button")
-                await visible_locator.click()
-                await page.wait_for_timeout(3000)
+            loc_btn = page.locator('text="Select Location"').first
+            if await loc_btn.count() > 0:
+                log.info(f"  {platform}: clicking location selector button")
+                await loc_btn.click()
+                await page.wait_for_timeout(2000)
                 
-                input_locator = page.locator('input[placeholder*="Search for area"]')
-                input_count = await input_locator.count()
-                visible_input = None
-                for i in range(input_count):
-                    loc = input_locator.nth(i)
-                    if await loc.is_visible():
-                        visible_input = loc
-                        
-                if visible_input:
-                    log.info(f"  {platform}: filling pincode {PINCODE}")
-                    await visible_input.click()
-                    await visible_input.fill(PINCODE)
-                    await page.wait_for_timeout(4000)
-                    
-                    clicked = await page.evaluate('''(pincode) => {
-                        let sug = Array.from(document.querySelectorAll('ul li, li, div[class*="suggestion"], div[class*="List"] div, div[class*="item"]')).find(el => {
-                            let t = (el.innerText || "").toLowerCase();
-                            return t.includes(pincode);
-                        });
-                        if (sug) {
-                            sug.click();
-                            return true;
-                        }
-                        let firstLi = document.querySelector('ul li, li');
-                        if (firstLi) {
-                            firstLi.click();
-                            return true;
-                        }
-                        return false;
-                    }''', PINCODE)
-                    if clicked:
-                        log.info(f"  {platform}: location suggestion clicked, waiting for update...")
-                        await page.wait_for_timeout(5000)
+                gps_btn = page.locator('text="Use My Current Location"').first
+                if await gps_btn.count() > 0:
+                    log.info(f"  {platform}: clicking 'Use My Current Location'")
+                    await gps_btn.click()
+                    await page.wait_for_timeout(5000)
         except Exception as e:
             log.warning(f"  {platform}: location setup error (continuing): {e}")
 
@@ -1002,7 +944,7 @@ async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
         try:
             log.info(f"  {platform}: navigating directly to search results page")
             q = SEARCH_QUERY.replace(" ", "+")
-            await page.goto(f"https://www.bigbasket.com/ps/?q={q}", wait_until="domcontentloaded", timeout=45_000)
+            await page.goto(f"https://www.zeptonow.com/search?query={q}", wait_until="domcontentloaded", timeout=45_000)
             await page.wait_for_timeout(8000)
         except Exception as e:
             log.error(f"  {platform}: navigation error: {e}")
@@ -1011,14 +953,14 @@ async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
         try:
             body_text = await page.inner_text("body")
             if "blocked" in body_text.lower() or "access denied" in body_text.lower() or "cloudflare" in body_text.lower():
-                raise BlinkitBlockedException("Big Basket search blocked by Cloudflare/Akamai")
+                raise BlinkitBlockedException("Zepto search blocked by Cloudflare")
         except BlinkitBlockedException:
             raise
         except Exception:
             pass
 
         # ── Step 4: Extract from DOM ─────────────────────────────
-        products = await _dom_fallback_bigbasket(page, SEARCH_QUERY)
+        products = await _dom_fallback_zepto(page, SEARCH_QUERY)
         if not products:
             try:
                 title = await page.title()
@@ -1047,7 +989,7 @@ async def run_scan(ctx: BrowserContext) -> None:
     log.info("═══ Starting scan cycle ═══")
 
     blinkit_blocked = False
-    bb_blocked = False
+    zepto_blocked = False
 
     # Scrape Blinkit
     try:
@@ -1060,18 +1002,18 @@ async def run_scan(ctx: BrowserContext) -> None:
         log.error(f"  Blinkit crashed: {e}")
         blinkit_results = []
 
-    # Scrape Big Basket
+    # Scrape Zepto
     try:
-        bb_results = await scan_bigbasket(ctx)
+        zepto_results = await scan_zepto(ctx)
     except BlinkitBlockedException as e:
-        log.warning(f"  Big Basket was blocked: {e}")
-        bb_blocked = True
-        bb_results = []
+        log.warning(f"  Zepto was blocked: {e}")
+        zepto_blocked = True
+        zepto_results = []
     except Exception as e:
-        log.error(f"  Big Basket crashed: {e}")
-        bb_results = []
+        log.error(f"  Zepto crashed: {e}")
+        zepto_results = []
 
-    results = blinkit_results + bb_results
+    results = blinkit_results + zepto_results
 
     total_found = 0
     total_in_stock = 0
@@ -1107,9 +1049,9 @@ async def run_scan(ctx: BrowserContext) -> None:
                     MISSING_COUNT.pop(alerted_key, None)
                     send_oos_alert(platform.capitalize(), name, "N/A", f"https://blinkit.com/s/?q={SEARCH_QUERY.replace(' ', '+')}")
 
-    bb_found = sum(1 for p in bb_results)
-    if bb_found > 0:
-        platform = "big basket"
+    zepto_found = sum(1 for p in zepto_results)
+    if zepto_found > 0:
+        platform = "zepto"
         for alerted_key in list(ALERTED):
             if alerted_key.startswith(f"{platform}_") and alerted_key not in seen_in_scan:
                 MISSING_COUNT[alerted_key] = MISSING_COUNT.get(alerted_key, 0) + 1
@@ -1119,7 +1061,7 @@ async def run_scan(ctx: BrowserContext) -> None:
                     OUT_OF_STOCK.add(alerted_key)
                     ALERTED.discard(alerted_key)
                     MISSING_COUNT.pop(alerted_key, None)
-                    send_oos_alert(platform.capitalize(), name, "N/A", "https://www.bigbasket.com")
+                    send_oos_alert(platform.capitalize(), name, "N/A", f"https://www.zeptonow.com/search?query={SEARCH_QUERY.replace(' ', '+')}")
 
     log.info(
         f"═══ Scan done: {total_found} products, "
@@ -1128,8 +1070,8 @@ async def run_scan(ctx: BrowserContext) -> None:
     )
 
     has_static_proxy = bool(os.environ.get("STATIC_PROXY"))
-    if blinkit_blocked and not has_static_proxy:
-        raise BlinkitBlockedException("Blinkit was blocked by Cloudflare/Akamai")
+    if (blinkit_blocked or zepto_blocked) and not has_static_proxy:
+        raise BlinkitBlockedException("Blinkit or Zepto was blocked by Cloudflare/Akamai")
 
 # =====================================================================
 # 🏥  HEALTH CHECK HTTP SERVER  — keeps Railway happy
@@ -1182,7 +1124,7 @@ async def main() -> None:
     log.info(f"🔍 Query: '{SEARCH_QUERY}'")
     log.info(f"⏱️  Interval: {SCAN_INTERVAL}s")
     log.info(f"🖥️  Headless: {HEADLESS}")
-    log.info("🛒 Platforms: Blinkit, Big Basket")
+    log.info("🛒 Platforms: Blinkit, Zepto")
     
     # Check if any notification method is configured
     has_pushover = bool(PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN)
