@@ -73,6 +73,35 @@ log = logging.getLogger("hotwheels")
 ALERTED: set[str]       = set()
 OUT_OF_STOCK: set[str]  = set()
 MISSING_COUNT: dict[str, int] = {}
+IS_FIRST_SCAN: bool     = True
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alerted_state.json")
+
+def load_state() -> None:
+    global ALERTED, OUT_OF_STOCK, IS_FIRST_SCAN
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+                ALERTED = set(data.get("alerted", []))
+                OUT_OF_STOCK = set(data.get("out_of_stock", []))
+                log.info(f"Loaded persistent state: {len(ALERTED)} alerted, {len(OUT_OF_STOCK)} out-of-stock items.")
+                if ALERTED:
+                    IS_FIRST_SCAN = False
+                    log.info("Non-empty persistent state loaded. Disabling startup alert suppression.")
+        except Exception as e:
+            log.warning(f"Failed to load persistent state: {e}")
+
+def save_state() -> None:
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({
+                "alerted": list(ALERTED),
+                "out_of_stock": list(OUT_OF_STOCK)
+            }, f)
+        log.debug("Saved persistent state to file.")
+    except Exception as e:
+        log.warning(f"Failed to save persistent state: {e}")
 
 # =====================================================================
 # 📦  DATA MODEL
@@ -1019,13 +1048,20 @@ async def run_scan(ctx: BrowserContext) -> None:
     total_in_stock = 0
     seen_in_scan = set()
 
+    global IS_FIRST_SCAN
     for product in results:
         total_found += 1
         key = f"{product.platform.lower()}_{product.name.lower()}"
         seen_in_scan.add(key)
         if product.in_stock:
             total_in_stock += 1
-            send_alert(product.platform, product.name, product.price, product.link)
+            if IS_FIRST_SCAN:
+                if key not in ALERTED:
+                    log.info(f"🔇 First-scan alert suppression: {product.platform}: '{product.name}' in-stock added to cache.")
+                    ALERTED.add(key)
+                    OUT_OF_STOCK.discard(key)
+            else:
+                send_alert(product.platform, product.name, product.price, product.link)
         else:
             mark_oos(product.platform, product.name, product.price, product.link)
 
@@ -1062,6 +1098,12 @@ async def run_scan(ctx: BrowserContext) -> None:
                     ALERTED.discard(alerted_key)
                     MISSING_COUNT.pop(alerted_key, None)
                     send_oos_alert(platform.capitalize(), name, "N/A", f"https://www.zeptonow.com/search?query={SEARCH_QUERY.replace(' ', '+')}")
+
+    if IS_FIRST_SCAN:
+        log.info(f"Suppressed startup alerts for {total_in_stock} in-stock items.")
+        IS_FIRST_SCAN = False
+
+    save_state()
 
     log.info(
         f"═══ Scan done: {total_found} products, "
@@ -1120,6 +1162,10 @@ async def main() -> None:
     log.info("🏁 Hot Wheels Alert Bot — STARTING")
     # Start health check server
     await start_health_check_server()
+    
+    # Load persistent alerted/oos state
+    load_state()
+    
     log.info(f"📍 Location: {LATITUDE}, {LONGITUDE} ({AREA_NAME})")
     log.info(f"🔍 Query: '{SEARCH_QUERY}'")
     log.info(f"⏱️  Interval: {SCAN_INTERVAL}s")
