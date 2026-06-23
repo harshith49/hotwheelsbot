@@ -318,19 +318,19 @@ async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
     except Exception as e:
         log.warning(f"Failed to fetch from Geonode: {e}")
 
-    # 2. Fetch from Proxyscrape
-    protocols = ['socks4', 'socks5', 'http']
-    log.info("Fetching fresh proxy lists from Proxyscrape...")
-    for proto in protocols:
-        url = f'https://api.proxyscrape.com/v2/?request=displayproxies&protocol={proto}&timeout=10000&country=IN&ssl=all&anonymity=all'
-        try:
-            r = http_requests.get(url, timeout=10)
-            for line in r.text.strip().split('\n'):
-                line = line.strip()
-                if line and ':' in line:
-                    all_proxies.append(f"{proto}://{line}")
-        except Exception as e:
-            log.warning(f"Failed to fetch {proto} from Proxyscrape: {e}")
+    # 2. Fetch from Proxyscrape v4
+    log.info("Fetching fresh proxy lists from Proxyscrape v4...")
+    url = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&country=in"
+    try:
+        r = http_requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            for p in data.get("proxies", []):
+                proxy_str = p.get("proxy")
+                if proxy_str:
+                    all_proxies.append(proxy_str)
+    except Exception as e:
+        log.warning(f"Failed to fetch from Proxyscrape v4: {e}")
 
     # Deduplicate proxies
     unique_proxies = list(set(all_proxies))[:25]
@@ -344,8 +344,9 @@ async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
     validator_browser = None
     try:
         validator_browser = await pw.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
+                "--headless=new",
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -366,7 +367,7 @@ async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
                 proxy={"server": proxy_server}
             )
             page = await context.new_page()
-            response = await page.goto("https://www.bigbasket.com", wait_until="domcontentloaded", timeout=8000)
+            response = await page.goto("https://blinkit.com", wait_until="domcontentloaded", timeout=8000)
             
             title = await page.title()
             body_text = await page.inner_text("body")
@@ -430,9 +431,14 @@ class BrowserManager:
         
         # Dynamically fetch a working proxy
         proxy_server = os.environ.get("STATIC_PROXY")
+        
+        is_railway = any(k in os.environ for k in ["RAILWAY_STATIC_URL", "RAILWAY_SERVICE_NAME", "RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_NAME", "RAILWAY_ENVIRONMENT_NAME"])
+        force_proxy = os.environ.get("FORCE_PROXY", "false").lower() == "true"
+        disable_proxy = os.environ.get("DISABLE_PROXY", "false").lower() == "true"
+        
         if proxy_server:
             log.info(f"Using static proxy from environment: {proxy_server}")
-        elif os.environ.get("DISABLE_PROXY", "false").lower() != "true":
+        elif (is_railway or force_proxy) and not disable_proxy:
             try:
                 proxy_server = await fetch_working_proxy(self._pw)
             except Exception as e:
@@ -448,17 +454,23 @@ class BrowserManager:
             "--window-size=1920,1080",
         ]
         
+        # Bypass Akamai/Cloudflare headless checks by using Google's new headless mode
+        actual_headless = HEADLESS
+        if HEADLESS:
+            launch_args.append("--headless=new")
+            actual_headless = False
+            
         if proxy_server:
             log.info(f"🚀 Launching browser with proxy: {proxy_server}")
             self._browser = await self._pw.chromium.launch(
-                headless=HEADLESS,
+                headless=actual_headless,
                 proxy={"server": proxy_server},
                 args=launch_args,
             )
         else:
             log.warning("⚠️ No working Indian proxy found. Launching directly (might be blocked on Railway)...")
             self._browser = await self._pw.chromium.launch(
-                headless=HEADLESS,
+                headless=actual_headless,
                 args=launch_args,
             )
         self._context = await self._browser.new_context(
@@ -986,39 +998,14 @@ async def scan_bigbasket(ctx: BrowserContext) -> list[Product]:
         except Exception as e:
             log.warning(f"  {platform}: location setup error (continuing): {e}")
 
-        # ── Step 3: Navigate/Search using homepage input ──────────
+        # ── Step 3: Navigate directly to search results page ──────
         try:
-            log.info(f"  {platform}: searching via homepage input box")
-            
-            selectors = [
-                'input[placeholder*="Search for Products"]',
-                'input[placeholder*="Search for products"]',
-                'input[placeholder*="Search 18000"]',
-                'input[placeholder*="Search"]',
-                'input[id*="search"]'
-            ]
-            combined_selector = ", ".join(selectors)
-            
-            visible_search = None
-            try:
-                # Wait up to 15 seconds for the React search box to appear in the DOM and be visible
-                visible_search = await page.wait_for_selector(combined_selector, state="visible", timeout=15000)
-            except Exception:
-                pass
-            
-            if visible_search:
-                await visible_search.click()
-                await visible_search.fill(SEARCH_QUERY)
-                await page.wait_for_timeout(1000)
-                await page.keyboard.press("Enter")
-            else:
-                log.info(f"  {platform}: search input not found, navigating directly")
-                q = SEARCH_QUERY.replace(" ", "+")
-                await page.goto(f"https://www.bigbasket.com/search/?q={q}", wait_until="domcontentloaded", timeout=45_000)
-            
+            log.info(f"  {platform}: navigating directly to search results page")
+            q = SEARCH_QUERY.replace(" ", "+")
+            await page.goto(f"https://www.bigbasket.com/ps/?q={q}", wait_until="domcontentloaded", timeout=45_000)
             await page.wait_for_timeout(8000)
         except Exception as e:
-            log.error(f"  {platform}: search error: {e}")
+            log.error(f"  {platform}: navigation error: {e}")
 
         # Check block again on search page
         try:
@@ -1140,8 +1127,9 @@ async def run_scan(ctx: BrowserContext) -> None:
         f"Next in {SCAN_INTERVAL}s ═══\n"
     )
 
-    if blinkit_blocked or bb_blocked:
-        raise BlinkitBlockedException("One or more platforms were blocked by Cloudflare/Akamai during this scan cycle")
+    has_static_proxy = bool(os.environ.get("STATIC_PROXY"))
+    if blinkit_blocked and not has_static_proxy:
+        raise BlinkitBlockedException("Blinkit was blocked by Cloudflare/Akamai")
 
 # =====================================================================
 # 🏥  HEALTH CHECK HTTP SERVER  — keeps Railway happy
