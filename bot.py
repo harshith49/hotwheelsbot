@@ -224,6 +224,8 @@ def send_alert(platform: str, name: str, price: float | str, link: str, *, force
 
 
 def send_oos_alert(platform: str, name: str, price: float | str, link: str) -> None:
+    return  # Disabled as per user request
+
     msg = f"🏎️ {name}\n💰 ₹{price}\n🏪 {platform} — Went Out of Stock!"
 
     if DRY_RUN:
@@ -364,7 +366,7 @@ async def fetch_working_proxy(pw: Playwright) -> Optional[str]:
                 proxy={"server": proxy_server}
             )
             page = await context.new_page()
-            response = await page.goto("https://blinkit.com", wait_until="domcontentloaded", timeout=8000)
+            response = await page.goto("https://www.bigbasket.com", wait_until="domcontentloaded", timeout=8000)
             
             title = await page.title()
             body_text = await page.inner_text("body")
@@ -427,8 +429,10 @@ class BrowserManager:
         self._pw = await async_playwright().start()
         
         # Dynamically fetch a working proxy
-        proxy_server = None
-        if os.environ.get("DISABLE_PROXY", "false").lower() != "true":
+        proxy_server = os.environ.get("STATIC_PROXY")
+        if proxy_server:
+            log.info(f"Using static proxy from environment: {proxy_server}")
+        elif os.environ.get("DISABLE_PROXY", "false").lower() != "true":
             try:
                 proxy_server = await fetch_working_proxy(self._pw)
             except Exception as e:
